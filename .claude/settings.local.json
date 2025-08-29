@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "additionalDirectories": [
+      "/usr/local",
+      "/proc/driver/nvidia"
+    ],
+    "allow": [
+      "Bash(python3:*)"
+    ]
+  }
+}
