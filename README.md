@@ -14,6 +14,7 @@ PyTorch-powered real-time object detection optimized for NVIDIA Jetson Nano with
 - **FP16 Optimization**: Half-precision for faster inference
 - **Live Video Display**: Real-time visualization with bounding boxes
 - **Terminal Mode**: Headless operation for SSH/remote use
+- **RTSP Streaming**: Hardware-accelerated H.264 streaming to mobile devices and network clients
 
 ## Setup
 
@@ -25,22 +26,25 @@ pip3 install ultralytics seaborn
 ## Main Scripts
 
 ### 1. GPU Motion Detection (Recommended)
-**File**: `gpu_motion_detection.py`
+**File**: `fast_gpu_motion.py`
 
 Advanced motion detection + object recognition with maximum efficiency:
 
 ```bash
 # Live video with motion detection
-python3 gpu_motion_detection.py -i 0
+python3 fast_gpu_motion.py -i 0
 
 # Terminal mode (faster, no display)
-python3 gpu_motion_detection.py -i 0 --no-display
+python3 fast_gpu_motion.py -i 0 --no-display
+
+# With RTSP streaming for mobile devices
+python3 fast_gpu_motion.py -i 0 --rtsp
+
+# Headless with RTSP streaming
+python3 fast_gpu_motion.py -i 0 --rtsp --no-display
 
 # Adjust motion sensitivity
-python3 gpu_motion_detection.py -i 0 --motion-threshold 30 --min-area 1000
-
-# Lower confidence for more detections
-python3 gpu_motion_detection.py -i 0 --conf 0.4
+python3 fast_gpu_motion.py -i 0 --motion-threshold 30 --min-area 1000
 ```
 
 **Features:**
@@ -62,8 +66,11 @@ python3 pytorch_gpu_detection.py -i 0
 # Terminal mode
 python3 pytorch_gpu_detection.py -i 0 --no-display
 
+# With RTSP streaming
+python3 pytorch_gpu_detection.py -i 0 --rtsp
+
 # Use larger model for better accuracy
-python3 pytorch_gpu_detection.py -i 0 --model yolov5m
+python3 pytorch_gpu_detection.py -i 0 --model yolov5m --rtsp
 ```
 
 **Features:**
@@ -94,13 +101,56 @@ python3 pytorch_gpu_detection.py -i 0 --model yolov5m
 4. **Close Other Apps**: Free GPU memory for detection
 5. **Use Motion Detection**: 10x more efficient than full-frame detection
 
+## RTSP Streaming
+
+Both scripts support hardware-accelerated RTSP streaming for remote viewing on mobile devices and network clients.
+
+### Enable RTSP Streaming
+```bash
+# Motion detection with RTSP
+python3 fast_gpu_motion.py -i 0 --rtsp
+
+# Object detection with RTSP  
+python3 pytorch_gpu_detection.py -i 0 --rtsp
+
+# Custom port
+python3 fast_gpu_motion.py -i 0 --rtsp --rtsp-port 5000
+```
+
+### View RTSP Stream
+Find your Jetson's IP address:
+```bash
+hostname -I
+```
+
+**VLC (iOS/Android/Desktop):**
+- Open VLC → Network Stream
+- Enter: `udp://YOUR_JETSON_IP:8554`
+- Replace `YOUR_JETSON_IP` with actual IP
+
+**GStreamer Client:**
+```bash
+gst-launch-1.0 udpsrc multicast-group=224.1.1.1 port=8554 ! application/x-rtp ! rtph264depay ! h264parse ! omxh264dec ! autovideosink
+```
+
+**FFplay:**
+```bash
+ffplay udp://224.1.1.1:8554
+```
+
+### RTSP Features
+- Hardware H.264 encoding (minimal CPU impact)
+- Real-time streaming with detection overlays
+- Works in both display and headless modes
+- Compatible with mobile VLC apps
+- Configurable streaming port
+
 ## Advanced Options
 
 ### Motion Detection Parameters
 ```bash
 --motion-threshold 25     # Motion sensitivity (lower = more sensitive)
 --min-area 500           # Minimum motion area to consider
---conf 0.5               # Object detection confidence
 ```
 
 ### Model Options
@@ -108,6 +158,12 @@ python3 pytorch_gpu_detection.py -i 0 --model yolov5m
 --model yolov5s          # Fast, lower accuracy
 --model yolov5m          # Balanced speed/accuracy
 --model yolov5l          # Slow, higher accuracy
+```
+
+### RTSP Options
+```bash
+--rtsp                   # Enable RTSP streaming
+--rtsp-port 8554         # Set streaming port (default: 8554)
 ```
 
 ## Detection Classes

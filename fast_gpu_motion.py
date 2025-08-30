@@ -5,9 +5,24 @@ import cv2
 import numpy as np
 import argparse
 import time
+import threading
+import socket
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import io
+from socketserver import ThreadingMixIn
+
+def get_local_ip():
+    """Get the local IP address of the Jetson"""
+    try:
+        # Connect to a remote address to find local IP
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(('8.8.8.8', 80))
+            return s.getsockname()[0]
+    except Exception:
+        return '192.168.1.100'  # Fallback IP
 
 class FastGPUMotionDetector:
-    def __init__(self, device="cuda"):
+    def __init__(self, device="cuda", enable_rtsp=False, rtsp_port=8554):
         self.device = device if torch.cuda.is_available() else "cpu"
         
         # Motion detection parameters (optimized for speed)
@@ -20,10 +35,22 @@ class FastGPUMotionDetector:
         self.background_model = None
         self.frame_counter = 0
         
+        # RTSP streaming setup
+        self.enable_rtsp = enable_rtsp
+        self.rtsp_port = rtsp_port
+        self.gst_pipeline = None
+        self.rtsp_thread = None
+        
+        if self.enable_rtsp:
+            self._setup_rtsp_pipeline()
+        
         print(f"🚀 Fast GPU Motion Detection on {self.device}")
         if self.device == "cuda":
             print(f"🎮 GPU: {torch.cuda.get_device_name(0)}")
             print(f"💾 Available GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+        if self.enable_rtsp:
+            local_ip = get_local_ip()
+            print(f"📡 HTTP Stream: http://{local_ip}:{self.rtsp_port}/stream.mjpg")
     
     def preprocess_frame_for_motion(self, frame):
         """Convert frame to GPU tensor for motion detection"""
@@ -74,7 +101,91 @@ class FastGPUMotionDetector:
         # Remove contained rectangles (smaller ones inside larger ones)
         filtered_areas = self.remove_contained_rectangles(merged_areas)
         
-        return filtered_areas, motion_mask_cpu
+        return filtered_areas
+    
+    def _setup_rtsp_pipeline(self):
+        """Setup HTTP streaming server for mobile compatibility"""
+        try:
+            self.current_frame = None
+            self.frame_lock = threading.Lock()
+            
+            # HTTP streaming handler
+            class StreamingHandler(BaseHTTPRequestHandler):
+                def __init__(self, detector, *args, **kwargs):
+                    self.detector = detector
+                    super().__init__(*args, **kwargs)
+                
+                def do_GET(self):
+                    if self.path == '/stream.mjpg':
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
+                        self.end_headers()
+                        
+                        while True:
+                            try:
+                                with self.detector.frame_lock:
+                                    if self.detector.current_frame is not None:
+                                        ret, buffer = cv2.imencode('.jpg', self.detector.current_frame, 
+                                                                  [cv2.IMWRITE_JPEG_QUALITY, 80])
+                                        if ret:
+                                            self.wfile.write(b'\r\n--frame\r\n')
+                                            self.send_header('Content-Type', 'image/jpeg')
+                                            self.send_header('Content-Length', len(buffer))
+                                            self.end_headers()
+                                            self.wfile.write(buffer.tobytes())
+                                time.sleep(0.033)  # ~30 FPS
+                            except Exception:
+                                break
+                    else:
+                        self.send_response(404)
+                        self.end_headers()
+                
+                def log_message(self, format, *args):
+                    pass  # Suppress HTTP logs
+            
+            # Threading HTTP server
+            class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+                allow_reuse_address = True
+                daemon_threads = True
+            
+            # Create handler with detector reference
+            handler = lambda *args, **kwargs: StreamingHandler(self, *args, **kwargs)
+            
+            # Start HTTP server in background thread
+            self.http_server = ThreadingHTTPServer(('0.0.0.0', self.rtsp_port), handler)
+            self.server_thread = threading.Thread(target=self.http_server.serve_forever, daemon=True)
+            self.server_thread.start()
+            
+            local_ip = get_local_ip()
+            print(f"✅ HTTP streaming server initialized")
+            print(f"📱 Mobile URL: http://{local_ip}:{self.rtsp_port}/stream.mjpg")
+            print(f"🌐 Browser URL: http://{local_ip}:{self.rtsp_port}/stream.mjpg")
+            
+        except Exception as e:
+            print(f"❌ Failed to setup HTTP streaming: {e}")
+            self.enable_rtsp = False
+    
+    def _start_rtsp_streaming(self):
+        """Start HTTP streaming server"""
+        if hasattr(self, 'http_server'):
+            print("🎬 HTTP streaming started")
+    
+    def _stop_rtsp_streaming(self):
+        """Stop HTTP streaming server"""
+        if hasattr(self, 'http_server'):
+            self.http_server.shutdown()
+            print("⏹️ HTTP streaming stopped")
+    
+    def _push_frame_to_rtsp(self, frame):
+        """Update current frame for HTTP streaming"""
+        if not self.enable_rtsp or not hasattr(self, 'current_frame'):
+            return
+        
+        try:
+            with self.frame_lock:
+                self.current_frame = frame.copy()
+        except Exception:
+            pass  # Silently handle streaming errors, motion_mask_cpu
     
     def merge_motion_areas(self, motion_areas):
         """Merge nearby motion rectangles into single rectangles per object"""
@@ -184,7 +295,7 @@ class FastGPUMotionDetector:
         return result_frame
     
     def run_motion_detection(self, video_source=0, show_video=True, show_overlay=True):
-        """Run ultra-fast GPU motion detection"""
+        """Run ultra-fast GPU motion detection with optional RTSP streaming"""
         # Open video source
         if isinstance(video_source, str) and video_source.isdigit():
             video_source = int(video_source)
@@ -193,6 +304,10 @@ class FastGPUMotionDetector:
         if not cap.isOpened():
             print(f"❌ Cannot open video source: {video_source}")
             return
+        
+        # Start RTSP streaming if enabled
+        if self.enable_rtsp:
+            self._start_rtsp_streaming()
         
         # Set camera resolution
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
@@ -206,6 +321,9 @@ class FastGPUMotionDetector:
         print(f"📹 Camera: {w}x{h} @ {fps_cam} FPS")
         print(f"🏃 Motion detection only (no object recognition)")
         print(f"🎨 Motion overlay: {'ON' if show_overlay else 'OFF'}")
+        if self.enable_rtsp:
+            local_ip = get_local_ip()
+            print(f"📡 Mobile URL: http://{local_ip}:{self.rtsp_port}/stream.mjpg")
         if show_video:
             print("🎮 Press 'q' to quit")
         else:
@@ -252,12 +370,21 @@ class FastGPUMotionDetector:
                     cv2.putText(result_frame, f"Motion Areas: {len(motion_areas)}", 
                                (10, info_y + 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                     
+                    # Push frame to RTSP stream (minimal performance impact)
+                    if self.enable_rtsp:
+                        self._push_frame_to_rtsp(result_frame)
+                    
                     # Display
                     cv2.imshow('Fast GPU Motion Detection', result_frame)
                     
                     if cv2.waitKey(1) & 0xFF == ord('q'):
                         break
                 else:
+                    # Push frame to RTSP stream even in headless mode
+                    if self.enable_rtsp:
+                        result_frame = self.draw_motion_areas(frame, motion_areas, show_overlay)
+                        self._push_frame_to_rtsp(result_frame)
+                    
                     # Terminal output
                     if motion_areas:
                         areas_info = [f"Area{i+1}({int(area)}px)" for i, (_, _, _, _, area) in enumerate(motion_areas)]
@@ -277,6 +404,10 @@ class FastGPUMotionDetector:
             cap.release()
             if show_video:
                 cv2.destroyAllWindows()
+            
+            # Stop RTSP streaming
+            if self.enable_rtsp:
+                self._stop_rtsp_streaming()
             
             # Final statistics
             elapsed = time.time() - start_time
@@ -299,6 +430,8 @@ def main():
     parser.add_argument('--device', '-d', default='cuda', help='Device (cuda or cpu)')
     parser.add_argument('--no-display', action='store_true', help='Run in terminal mode')
     parser.add_argument('--no-overlay', action='store_true', help='Disable motion overlay for more speed')
+    parser.add_argument('--rtsp', action='store_true', help='Enable RTSP streaming')
+    parser.add_argument('--rtsp-port', type=int, default=8554, help='RTSP streaming port (default: 8554)')
     
     args = parser.parse_args()
     
@@ -311,12 +444,14 @@ def main():
     print(f"⚡ Device: {args.device.upper()}")
     print(f"🎯 Motion Threshold: {args.motion_threshold}")
     print(f"📏 Minimum Area: {args.min_area}")
+    if args.rtsp:
+        print(f"📡 RTSP Streaming: Enabled on port {args.rtsp_port}")
     if args.device == 'cuda':
         print(f"🎮 GPU: {torch.cuda.get_device_name(0)}")
     print("=" * 60)
     
     try:
-        detector = FastGPUMotionDetector(device=args.device)
+        detector = FastGPUMotionDetector(device=args.device, enable_rtsp=args.rtsp, rtsp_port=args.rtsp_port)
         
         # Set motion detection parameters
         detector.motion_threshold = args.motion_threshold
