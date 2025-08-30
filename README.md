@@ -8,84 +8,94 @@ PyTorch-powered real-time object detection optimized for NVIDIA Jetson Nano with
 ## Features
 
 - **Full GPU Acceleration**: PyTorch with CUDA support for maximum performance
-- **Motion Detection**: Advanced GPU-accelerated motion detection with background subtraction
-- **Smart Processing**: Object detection only runs in motion areas for efficiency
-- **Real-time Performance**: 15-35 FPS on Jetson Nano 4GB
+- **Real-time Performance**: 15-25 FPS on Jetson Nano 4GB
 - **FP16 Optimization**: Half-precision for faster inference
 - **Live Video Display**: Real-time visualization with bounding boxes
 - **Terminal Mode**: Headless operation for SSH/remote use
 - **RTSP Streaming**: Hardware-accelerated H.264 streaming to mobile devices and network clients
 
-## Setup
+## Prerequisites
 
-Install PyTorch dependencies:
+Make sure you have PyTorch with CUDA support installed:
 ```bash
-pip3 install ultralytics seaborn
+pip3 install ultralytics torch torchvision
 ```
 
-## Main Scripts
+## How to Run
 
-### 1. GPU Motion Detection (Recommended)
-**File**: `fast_gpu_motion.py`
+The main script is `pytorch_gpu_detection.py` which provides direct YOLOv5 detection on every frame.
 
-Advanced motion detection + object recognition with maximum efficiency:
+### Basic Usage
 
+**Live video detection with camera display:**
 ```bash
-# Live video with motion detection
-python3 fast_gpu_motion.py -i 0
-
-# Terminal mode (faster, no display)
-python3 fast_gpu_motion.py -i 0 --no-display
-
-# With RTSP streaming for mobile devices
-python3 fast_gpu_motion.py -i 0 --rtsp
-
-# Headless with RTSP streaming
-python3 fast_gpu_motion.py -i 0 --rtsp --no-display
-
-# Adjust motion sensitivity
-python3 fast_gpu_motion.py -i 0 --motion-threshold 30 --min-area 1000
-```
-
-**Features:**
-- GPU motion detection at 20-35 FPS
-- Object detection only in motion areas (10x efficiency gain)
-- Background subtraction with adaptive learning
-- Morphological filtering for noise reduction
-- Real-time motion visualization
-
-### 2. Pure GPU Object Detection
-**File**: `pytorch_gpu_detection.py`
-
-Direct YOLOv5 detection on every frame:
-
-```bash
-# Live video detection
 python3 pytorch_gpu_detection.py -i 0
-
-# Terminal mode
-python3 pytorch_gpu_detection.py -i 0 --no-display
-
-# With RTSP streaming
-python3 pytorch_gpu_detection.py -i 0 --rtsp
-
-# Use larger model for better accuracy
-python3 pytorch_gpu_detection.py -i 0 --model yolov5m --rtsp
 ```
 
-**Features:**
-- Full-frame object detection at 15-25 FPS
-- Direct PyTorch YOLOv5 inference
-- FP16 optimization for speed
-- Automatic model download
+**Headless mode (no display, perfect for SSH):**
+```bash
+python3 pytorch_gpu_detection.py -i 0 --no-display
+```
 
-## Performance Comparison
+**With RTSP streaming for remote viewing:**
+```bash
+python3 pytorch_gpu_detection.py -i 0 --rtsp
+```
 
-| Method | FPS | Efficiency | Use Case |
-|--------|-----|------------|-----------|
-| GPU Motion Detection | 25-35 | Highest | Security, monitoring |
-| Pure GPU Detection | 15-25 | High | General detection |
-| CPU OpenCV (old) | 0.8-2 | Low | Not recommended |
+**Headless with RTSP streaming:**
+```bash
+python3 pytorch_gpu_detection.py -i 0 --rtsp --no-display
+```
+
+### Advanced Options
+
+**Use different YOLOv5 models:**
+```bash
+# Fast model (default)
+python3 pytorch_gpu_detection.py -i 0 --model yolov5s
+
+# Better accuracy, slower
+python3 pytorch_gpu_detection.py -i 0 --model yolov5m
+
+# Best accuracy, slowest
+python3 pytorch_gpu_detection.py -i 0 --model yolov5l
+```
+
+**Custom confidence threshold:**
+```bash
+python3 pytorch_gpu_detection.py -i 0 --conf 0.6
+```
+
+**Use video file instead of camera:**
+```bash
+python3 pytorch_gpu_detection.py -i /path/to/video.mp4
+```
+
+**Custom RTSP port:**
+```bash
+python3 pytorch_gpu_detection.py -i 0 --rtsp --rtsp-port 5000
+```
+
+### Complete Command Line Options
+
+```bash
+python3 pytorch_gpu_detection.py [OPTIONS]
+
+Options:
+  -i, --input          Input source (0 for camera, path for video file)
+  --model              YOLOv5 model (yolov5s, yolov5m, yolov5l)
+  --conf               Confidence threshold (0.0-1.0, default: 0.5)
+  --no-display         Run without video display (headless mode)
+  --rtsp               Enable RTSP streaming
+  --rtsp-port          RTSP streaming port (default: 8554)
+```
+
+### Performance
+
+- **FPS**: 15-25 FPS on Jetson Nano 4GB
+- **Efficiency**: Full-frame object detection with GPU acceleration
+- **Memory Usage**: ~2GB GPU memory
+- **Models**: Automatic download of YOLOv5 models
 
 ## Controls
 
@@ -99,22 +109,21 @@ python3 pytorch_gpu_detection.py -i 0 --model yolov5m --rtsp
 2. **Increase GPU Memory**: `sudo systemctl disable nvzramconfig`
 3. **Cool the Jetson**: Use active cooling for sustained performance
 4. **Close Other Apps**: Free GPU memory for detection
-5. **Use Motion Detection**: 10x more efficient than full-frame detection
 
 ## RTSP Streaming
 
-Both scripts support hardware-accelerated RTSP streaming for remote viewing on mobile devices and network clients.
+The script supports hardware-accelerated RTSP streaming for remote viewing on mobile devices and network clients.
 
 ### Enable RTSP Streaming
 ```bash
-# Motion detection with RTSP
-python3 fast_gpu_motion.py -i 0 --rtsp
-
-# Object detection with RTSP  
+# Basic RTSP streaming
 python3 pytorch_gpu_detection.py -i 0 --rtsp
 
 # Custom port
-python3 fast_gpu_motion.py -i 0 --rtsp --rtsp-port 5000
+python3 pytorch_gpu_detection.py -i 0 --rtsp --rtsp-port 5000
+
+# Headless with RTSP
+python3 pytorch_gpu_detection.py -i 0 --rtsp --no-display
 ```
 
 ### View RTSP Stream
@@ -147,21 +156,13 @@ ffplay udp://224.1.1.1:8554
 
 ## Advanced Options
 
-### Motion Detection Parameters
+### Command Line Options Summary
 ```bash
---motion-threshold 25     # Motion sensitivity (lower = more sensitive)
---min-area 500           # Minimum motion area to consider
-```
-
-### Model Options
-```bash
---model yolov5s          # Fast, lower accuracy
---model yolov5m          # Balanced speed/accuracy
---model yolov5l          # Slow, higher accuracy
-```
-
-### RTSP Options
-```bash
+--model yolov5s          # Fast model (default)
+--model yolov5m          # Balanced speed/accuracy  
+--model yolov5l          # Best accuracy
+--conf 0.5               # Confidence threshold (default: 0.5)
+--no-display             # Headless mode
 --rtsp                   # Enable RTSP streaming
 --rtsp-port 8554         # Set streaming port (default: 8554)
 ```
@@ -180,13 +181,13 @@ Optimized for security and surveillance applications:
 
 - **Hardware**: NVIDIA Jetson Nano 4GB with Tegra X1 GPU
 - **Framework**: PyTorch with CUDA acceleration
-- **Model**: YOLOv5s with FP16 optimization
-- **Motion Algorithm**: GPU background subtraction with morphological filtering
-- **Memory Usage**: ~2GB GPU memory for motion detection mode
+- **Model**: YOLOv5 with FP16 optimization
+- **Memory Usage**: ~2GB GPU memory
 
 ## Troubleshooting
 
 1. **CUDA not available**: Ensure PyTorch was compiled with CUDA support
-2. **Out of memory**: Use motion detection mode or close other applications  
+2. **Out of memory**: Close other applications or use a smaller model (yolov5s)
 3. **Low FPS**: Check GPU temperature and use `nvpmodel -m 0`
-4. **Model download fails**: Check internet connection, model downloads automatically
+4. **Model download fails**: Check internet connection, models download automatically
+5. **Camera not found**: Check camera connection and permissions, try different input numbers
