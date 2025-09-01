@@ -22,6 +22,11 @@ def get_local_ip():
     except Exception:
         return '192.168.1.100'  # Fallback IP
 
+def get_stream_url(rtsp_port=8554):
+    """Get the HTTP stream URL for RTSP streaming"""
+    local_ip = get_local_ip()
+    return f"http://{local_ip}:{rtsp_port}/stream.mjpg"
+
 class PyTorchGPUDetector:
     def __init__(self, model_name="yolov5s", conf_threshold=0.5, device="cuda", enable_rtsp=False, rtsp_port=8554):
         self.conf_threshold = conf_threshold
@@ -50,6 +55,10 @@ class PyTorchGPUDetector:
         self.rtsp_port = rtsp_port
         self.gst_pipeline = None
         self.rtsp_thread = None
+        
+        # GUI toggle states
+        self.show_gui = True
+        self.show_detections = True
         
         if self.enable_rtsp:
             self._setup_rtsp_pipeline()
@@ -80,7 +89,8 @@ class PyTorchGPUDetector:
             
             if self.enable_rtsp:
                 local_ip = get_local_ip()
-                print(f"📡 HTTP Stream: http://{local_ip}:{self.rtsp_port}/stream.mjpg")
+                stream_url = get_stream_url()
+                print(f"📡 HTTP Stream: {get_stream_url}")
             
         except Exception as e:
             print(f"❌ Error loading model: {e}")
@@ -138,6 +148,16 @@ class PyTorchGPUDetector:
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
         return frame
+    
+    def mouse_callback(self, event, x, y, flags, param):
+        """Handle mouse clicks for toggle buttons"""
+        if event == cv2.EVENT_LBUTTONDOWN:
+            # GUI toggle button (top-right corner)
+            if x >= 540 and x <= 630 and y >= 10 and y <= 40:
+                self.show_gui = not self.show_gui
+            # Detection toggle button (below GUI button)
+            elif x >= 540 and x <= 630 and y >= 50 and y <= 80:
+                self.show_detections = not self.show_detections
     
     def _setup_rtsp_pipeline(self):
         """Setup HTTP streaming server for mobile compatibility"""
@@ -284,21 +304,45 @@ class PyTorchGPUDetector:
                 
                 if show_video:
                     # Draw results
-                    result_frame = self.draw_detections(frame.copy(), detections)
+                    result_frame = frame.copy()
+                    if self.show_detections:
+                        result_frame = self.draw_detections(result_frame, detections)
                     
-                    # Add performance info
-                    cv2.putText(result_frame, f"GPU FPS: {inference_fps:.1f}", 
-                               (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                    cv2.putText(result_frame, f"Real FPS: {fps_actual:.1f}", 
-                               (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                    cv2.putText(result_frame, f"Objects: {len(detections)}", 
-                               (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    # Draw toggle buttons
+                    # GUI toggle button
+                    gui_color = (0, 255, 0) if self.show_gui else (0, 0, 255)
+                    cv2.rectangle(result_frame, (540, 10), (630, 40), gui_color, 2)
+                    cv2.putText(result_frame, "GUI", (550, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, gui_color, 2)
+                    
+                    # Detection toggle button
+                    det_color = (0, 255, 0) if self.show_detections else (0, 0, 255)
+                    cv2.rectangle(result_frame, (540, 50), (630, 80), det_color, 2)
+                    cv2.putText(result_frame, "DET", (550, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, det_color, 2)
+                    
+                    # Add performance info (conditionally)
+                    if self.show_gui:
+                        cv2.putText(result_frame, f"GPU FPS: {inference_fps:.1f}", 
+                                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                        cv2.putText(result_frame, f"Real FPS: {fps_actual:.1f}", 
+                                   (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                        cv2.putText(result_frame, f"Objects: {len(detections)}", 
+                                   (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                        
+                        # Add HTTP stream URL if RTSP is enabled
+                        if self.enable_rtsp:
+                            local_ip = get_local_ip()
+                            stream_url = f"http://{local_ip}:{self.rtsp_port}/stream.mjpg"
+                            cv2.putText(result_frame, f"Stream: {stream_url}", 
+                                       (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
                     
                     # Push frame to RTSP stream (minimal performance impact)
                     if self.enable_rtsp:
                         self._push_frame_to_rtsp(result_frame)
                     
-                    # Display
+                    # Display fullscreen
+                    cv2.namedWindow('PyTorch GPU Detection', cv2.WINDOW_NORMAL)
+                    cv2.setWindowProperty('PyTorch GPU Detection', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+                    cv2.setMouseCallback('PyTorch GPU Detection', self.mouse_callback)
                     cv2.imshow('PyTorch GPU Detection', result_frame)
                     
                     if cv2.waitKey(1) & 0xFF == ord('q'):
