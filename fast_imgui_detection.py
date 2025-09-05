@@ -5,6 +5,9 @@ import numpy as np
 import threading
 import time
 import argparse
+import os
+from datetime import datetime
+from pathlib import Path
 from pytorch_gpu_detection import PyTorchGPUDetector, get_local_ip, get_stream_url
 
 class FastImGuiDetector:
@@ -64,6 +67,29 @@ class FastImGuiDetector:
         self.objects = 0
         self.total_objects = 0
         
+        # Recording functionality
+        self.is_recording = False
+        self.video_writer = None
+        self.recording_start_time = None
+        
+        # Snapshot feedback
+        self.show_snapshot_feedback = False
+        self.snapshot_feedback_timer = 0
+        
+        # Tab system
+        self.current_tab = "monitor"  # "monitor" or "gallery"
+        self.tab_height = 40
+        
+        # Gallery
+        self.gallery_items = []
+        self.gallery_folders = []
+        self.current_folder = None  # None means showing folder list
+        self.gallery_scroll = 0
+        self.gallery_item_height = 120
+        self.gallery_cols = 4
+        self.thumbnail_cache = {}
+        self.selected_media = None  # For viewing full media
+        
         # Mouse
         self.mouse_pos = (0, 0)
         self.mouse_clicked = False
@@ -74,8 +100,595 @@ class FastImGuiDetector:
         
         print("✅ Fast ImGui detector ready!")
         
+        # Create recordings directory structure
+        self.setup_recording_directories()
+        
+        # Load gallery items
+        self.refresh_gallery()
+        
         # Start automatic initialization
         self.start_initialization()
+    
+    def setup_recording_directories(self):
+        """Create directory structure for recordings"""
+        base_dir = Path("recordings")
+        base_dir.mkdir(exist_ok=True)
+        
+        # Create date-based subdirectory
+        today = datetime.now().strftime("%Y-%m-%d")
+        self.today_dir = base_dir / today
+        self.today_dir.mkdir(exist_ok=True)
+        
+        print(f"📁 Recording directory: {self.today_dir}")
+    
+    def get_timestamp_filename(self, prefix, extension):
+        """Generate timestamp-based filename with prefix"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return f"{prefix}_{timestamp}.{extension}"
+    
+    def start_recording(self):
+        """Start video recording"""
+        if not self.current_frame is None and not self.is_recording:
+            # Ensure directory exists for today
+            today = datetime.now().strftime("%Y-%m-%d")
+            today_dir = Path("recordings") / today
+            today_dir.mkdir(exist_ok=True)
+            
+            # Generate filename
+            filename = self.get_timestamp_filename("video", "mp4")
+            filepath = today_dir / filename
+            
+            # Get frame dimensions
+            h, w = self.current_frame.shape[:2]
+            
+            # Initialize video writer with MP4 format
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            self.video_writer = cv2.VideoWriter(str(filepath), fourcc, 20.0, (w, h))
+            
+            if self.video_writer.isOpened():
+                self.is_recording = True
+                self.recording_start_time = time.time()
+                print(f"🎥 Started recording: {filepath}")
+                return True
+            else:
+                print("❌ Failed to start recording")
+                return False
+        return False
+    
+    def stop_recording(self):
+        """Stop video recording"""
+        if self.is_recording and self.video_writer:
+            self.video_writer.release()
+            self.video_writer = None
+            self.is_recording = False
+            duration = time.time() - self.recording_start_time if self.recording_start_time else 0
+            print(f"⏹️ Recording stopped (duration: {duration:.1f}s)")
+            self.recording_start_time = None
+            # Refresh gallery if we're in gallery tab
+            if self.current_tab == 'gallery':
+                self.refresh_gallery()
+    
+    def take_snapshot(self):
+        """Take a snapshot image"""
+        if self.current_frame is not None:
+            # Ensure directory exists for today
+            today = datetime.now().strftime("%Y-%m-%d")
+            today_dir = Path("recordings") / today
+            today_dir.mkdir(exist_ok=True)
+            
+            # Generate filename
+            filename = self.get_timestamp_filename("image", "jpg")
+            filepath = today_dir / filename
+            
+            # Save current frame
+            success = cv2.imwrite(str(filepath), self.current_frame)
+            if success:
+                print(f"📸 Snapshot saved: {filepath}")
+                # Show visual feedback
+                self.show_snapshot_feedback = True
+                self.snapshot_feedback_timer = time.time()
+                # Refresh gallery if we're in gallery tab
+                if self.current_tab == 'gallery':
+                    self.refresh_gallery()
+                return True
+            else:
+                print("❌ Failed to save snapshot")
+                return False
+        return False
+    
+    def refresh_gallery(self):
+        """Scan recordings directory and load folders and media files"""
+        self.gallery_items = []
+        self.gallery_folders = []
+        recordings_dir = Path("recordings")
+        
+        if not recordings_dir.exists():
+            return
+        
+        # Scan all date directories for folder list
+        for date_dir in sorted(recordings_dir.glob("*"), reverse=True):  # Most recent first
+            if date_dir.is_dir():
+                # Count media files in this folder
+                media_count = 0
+                media_count += len(list(date_dir.glob("image_*.jpg")))
+                media_count += len(list(date_dir.glob("video_*.mp4")))
+                media_count += len(list(date_dir.glob("video_*.avi")))
+                
+                if media_count > 0:
+                    folder_info = {
+                        'path': date_dir,
+                        'name': date_dir.name,
+                        'count': media_count,
+                        'mtime': date_dir.stat().st_mtime
+                    }
+                    self.gallery_folders.append(folder_info)
+        
+        # If we're viewing a specific folder, load its media files
+        if self.current_folder:
+            folder_path = Path(self.current_folder)
+            if folder_path.exists():
+                media_files = []
+                
+                # Add images
+                for img_file in folder_path.glob("image_*.jpg"):
+                    media_files.append(img_file)
+                
+                # Add videos  
+                for video_file in folder_path.glob("video_*.mp4"):
+                    media_files.append(video_file)
+                
+                for video_file in folder_path.glob("video_*.avi"):
+                    media_files.append(video_file)
+                
+                # Sort files by modification time (newest first)
+                media_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+                
+                for file_path in media_files:
+                    item = {
+                        'path': file_path,
+                        'name': file_path.name,
+                        'type': 'image' if file_path.suffix.lower() in ['.jpg', '.jpeg', '.png'] else 'video',
+                        'size': file_path.stat().st_size,
+                        'mtime': file_path.stat().st_mtime
+                    }
+                    self.gallery_items.append(item)
+        
+        if self.current_folder:
+            print(f"📁 Folder loaded: {len(self.gallery_items)} items in {self.current_folder}")
+        else:
+            print(f"📁 Gallery loaded: {len(self.gallery_folders)} folders")
+    
+    def generate_thumbnail(self, file_path, size=(80, 80)):
+        """Generate thumbnail for image or video file"""
+        cache_key = f"{file_path}_{size[0]}x{size[1]}"
+        
+        if cache_key in self.thumbnail_cache:
+            return self.thumbnail_cache[cache_key]
+        
+        try:
+            if file_path.suffix.lower() in ['.jpg', '.jpeg', '.png']:
+                # Image thumbnail
+                img = cv2.imread(str(file_path))
+                if img is not None:
+                    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    h, w = img_rgb.shape[:2]
+                    
+                    # Calculate aspect ratio preserving dimensions
+                    aspect = w / h
+                    if aspect > 1:
+                        new_w, new_h = size[0], int(size[0] / aspect)
+                    else:
+                        new_w, new_h = int(size[1] * aspect), size[1]
+                    
+                    img_resized = cv2.resize(img_rgb, (new_w, new_h))
+                    
+                    # Create centered thumbnail with black background
+                    thumbnail = np.zeros((size[1], size[0], 3), dtype=np.uint8)
+                    y_offset = (size[1] - new_h) // 2
+                    x_offset = (size[0] - new_w) // 2
+                    thumbnail[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = img_resized
+                    
+                    # Convert to pygame surface
+                    thumbnail_rotated = np.rot90(thumbnail)
+                    thumbnail_flipped = np.flipud(thumbnail_rotated)
+                    surface = pygame.surfarray.make_surface(thumbnail_flipped)
+                    
+                    self.thumbnail_cache[cache_key] = surface
+                    return surface
+            
+            elif file_path.suffix.lower() in ['.mp4', '.avi']:
+                # Video thumbnail - get first frame
+                cap = cv2.VideoCapture(str(file_path))
+                ret, frame = cap.read()
+                cap.release()
+                
+                if ret:
+                    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    h, w = img_rgb.shape[:2]
+                    
+                    # Calculate aspect ratio preserving dimensions
+                    aspect = w / h
+                    if aspect > 1:
+                        new_w, new_h = size[0], int(size[0] / aspect)
+                    else:
+                        new_w, new_h = int(size[1] * aspect), size[1]
+                    
+                    img_resized = cv2.resize(img_rgb, (new_w, new_h))
+                    
+                    # Create centered thumbnail with black background
+                    thumbnail = np.zeros((size[1], size[0], 3), dtype=np.uint8)
+                    y_offset = (size[1] - new_h) // 2
+                    x_offset = (size[0] - new_w) // 2
+                    thumbnail[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = img_resized
+                    
+                    # Convert to pygame surface
+                    thumbnail_rotated = np.rot90(thumbnail)
+                    thumbnail_flipped = np.flipud(thumbnail_rotated)
+                    surface = pygame.surfarray.make_surface(thumbnail_flipped)
+                    
+                    self.thumbnail_cache[cache_key] = surface
+                    return surface
+                    
+        except Exception as e:
+            print(f"❌ Error generating thumbnail for {file_path}: {e}")
+        
+        # Return default thumbnail on error
+        return self.create_default_thumbnail(size)
+    
+    def create_default_thumbnail(self, size=(80, 80)):
+        """Create a default thumbnail surface"""
+        surface = pygame.Surface(size)
+        surface.fill((60, 60, 60))
+        pygame.draw.rect(surface, (100, 100, 100), (0, 0, size[0], size[1]), 2)
+        return surface
+    
+    def render_media_viewer(self):
+        """Render full media viewer for selected image or video"""
+        if not self.selected_media:
+            return
+        
+        # Overlay background
+        overlay = pygame.Surface((self.screen_width, self.screen_height), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 200))
+        self.screen.blit(overlay, (0, 0))
+        
+        # Media viewer area
+        viewer_margin = 50
+        viewer_w = self.screen_width - 2 * viewer_margin
+        viewer_h = self.screen_height - 2 * viewer_margin
+        viewer_x = viewer_margin
+        viewer_y = viewer_margin
+        
+        # Background
+        pygame.draw.rect(self.screen, self.panel_bg, (viewer_x, viewer_y, viewer_w, viewer_h))
+        pygame.draw.rect(self.screen, self.text_color, (viewer_x, viewer_y, viewer_w, viewer_h), 2)
+        
+        # Title bar
+        title_h = 40
+        pygame.draw.rect(self.screen, (50, 50, 50), (viewer_x, viewer_y, viewer_w, title_h))
+        self.draw_text(f"📄 {self.selected_media['name']}", viewer_x + 10, viewer_y + 10, self.text_color)
+        
+        # Close button
+        close_x = viewer_x + viewer_w - 80
+        close_y = viewer_y + 5
+        if self.draw_button(close_x, close_y, 70, 30, "✕ Close", style='error'):
+            self.selected_media = None
+            return
+        
+        # Media display area
+        media_y = viewer_y + title_h
+        media_h = viewer_h - title_h - 80
+        media_w = viewer_w
+        
+        try:
+            file_path = self.selected_media['path']
+            
+            if self.selected_media['type'] == 'image':
+                # Display image
+                img = cv2.imread(str(file_path))
+                if img is not None:
+                    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    h, w = img_rgb.shape[:2]
+                    
+                    # Scale to fit viewer area
+                    scale_x = media_w / w
+                    scale_y = media_h / h
+                    scale = min(scale_x, scale_y, 1.0)  # Don't upscale
+                    
+                    new_w = int(w * scale)
+                    new_h = int(h * scale)
+                    
+                    # Center the image
+                    img_x = viewer_x + (media_w - new_w) // 2
+                    img_y = media_y + (media_h - new_h) // 2
+                    
+                    # Resize and convert to pygame surface
+                    img_resized = cv2.resize(img_rgb, (new_w, new_h))
+                    img_rotated = np.rot90(img_resized)
+                    img_flipped = np.flipud(img_rotated)
+                    img_surface = pygame.surfarray.make_surface(img_flipped)
+                    
+                    self.screen.blit(img_surface, (img_x, img_y))
+                    
+            elif self.selected_media['type'] == 'video':
+                # Display video info and first frame as preview
+                cap = cv2.VideoCapture(str(file_path))
+                ret, frame = cap.read()
+                
+                if ret:
+                    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    h, w = img_rgb.shape[:2]
+                    
+                    # Scale to fit viewer area
+                    scale_x = media_w / w
+                    scale_y = media_h / h
+                    scale = min(scale_x, scale_y, 1.0)
+                    
+                    new_w = int(w * scale)
+                    new_h = int(h * scale)
+                    
+                    # Center the frame
+                    img_x = viewer_x + (media_w - new_w) // 2
+                    img_y = media_y + (media_h - new_h) // 2
+                    
+                    # Resize and convert to pygame surface
+                    img_resized = cv2.resize(img_rgb, (new_w, new_h))
+                    img_rotated = np.rot90(img_resized)
+                    img_flipped = np.flipud(img_rotated)
+                    img_surface = pygame.surfarray.make_surface(img_flipped)
+                    
+                    self.screen.blit(img_surface, (img_x, img_y))
+                    
+                    # Video play icon overlay
+                    icon_size = 60
+                    icon_x = img_x + (new_w - icon_size) // 2
+                    icon_y = img_y + (new_h - icon_size) // 2
+                    
+                    # Play button background
+                    play_surface = pygame.Surface((icon_size, icon_size), pygame.SRCALPHA)
+                    pygame.draw.circle(play_surface, (0, 0, 0, 120), (icon_size//2, icon_size//2), icon_size//2)
+                    pygame.draw.circle(play_surface, (255, 255, 255, 200), (icon_size//2, icon_size//2), icon_size//2, 3)
+                    
+                    # Play triangle
+                    triangle_points = [
+                        (icon_size//2 - 10, icon_size//2 - 15),
+                        (icon_size//2 - 10, icon_size//2 + 15),
+                        (icon_size//2 + 15, icon_size//2)
+                    ]
+                    pygame.draw.polygon(play_surface, (255, 255, 255), triangle_points)
+                    
+                    self.screen.blit(play_surface, (icon_x, icon_y))
+                
+                cap.release()
+                
+        except Exception as e:
+            # Error display
+            error_text = f"Error loading media: {e}"
+            self.draw_text(error_text, viewer_x + 10, media_y + 10, self.red)
+        
+        # Info panel at bottom
+        info_y = viewer_y + viewer_h - 70
+        info_h = 60
+        pygame.draw.rect(self.screen, (40, 40, 40), (viewer_x, info_y, viewer_w, info_h))
+        
+        # File info
+        size_mb = self.selected_media['size'] / (1024 * 1024)
+        info_text = f"📄 Size: {size_mb:.1f}MB  |  📅 Modified: {datetime.fromtimestamp(self.selected_media['mtime']).strftime('%Y-%m-%d %H:%M:%S')}"
+        self.draw_text(info_text, viewer_x + 10, info_y + 10, (200, 200, 200))
+        
+        # Action buttons
+        button_y = info_y + 30
+        if self.selected_media['type'] == 'video':
+            if self.draw_button(viewer_x + 10, button_y, 120, 25, "🎬 Play in Player", style='normal'):
+                # Try to open with default video player
+                try:
+                    import subprocess
+                    subprocess.Popen(['xdg-open', str(self.selected_media['path'])], start_new_session=True)
+                except Exception as e:
+                    print(f"❌ Error opening video: {e}")
+        
+        # Delete button (with confirmation needed)
+        if self.draw_button(viewer_x + viewer_w - 120, button_y, 110, 25, "🗑️ Delete File", style='error'):
+            print(f"⚠️ Delete functionality not implemented for safety")
+    
+    def render_tabs(self):
+        """Render tab interface"""
+        tab_x = 10
+        tab_y = 10
+        tab_width = 100
+        
+        # Monitor tab
+        monitor_style = 'success' if self.current_tab == 'monitor' else 'normal'
+        if self.draw_button(tab_x, tab_y, tab_width, self.tab_height, "📹 Monitor", style=monitor_style):
+            self.current_tab = 'monitor'
+        
+        # Gallery tab
+        gallery_style = 'success' if self.current_tab == 'gallery' else 'normal'  
+        if self.draw_button(tab_x + tab_width + 5, tab_y, tab_width, self.tab_height, "🖼️ Gallery", style=gallery_style):
+            self.current_tab = 'gallery'
+            self.refresh_gallery()  # Refresh when switching to gallery
+    
+    def render_gallery(self):
+        """Render gallery view with folder browsing and thumbnail grid"""
+        # Gallery area
+        gallery_x = 10
+        gallery_y = 60  # Below tabs
+        gallery_w = self.screen_width - 20
+        gallery_h = self.screen_height - gallery_y - 10
+        
+        # Background
+        pygame.draw.rect(self.screen, self.panel_bg, (gallery_x, gallery_y, gallery_w, gallery_h))
+        pygame.draw.rect(self.screen, self.text_color, (gallery_x, gallery_y, gallery_w, gallery_h), 1)
+        
+        # Navigation bar
+        nav_h = 40
+        pygame.draw.rect(self.screen, (50, 50, 50), (gallery_x, gallery_y, gallery_w, nav_h))
+        
+        nav_y = gallery_y + 10
+        
+        # Back button (if in folder view)
+        if self.current_folder:
+            if self.draw_button(gallery_x + 10, nav_y, 80, 25, "← Back", style='normal'):
+                self.current_folder = None
+                self.gallery_scroll = 0
+                self.refresh_gallery()
+            
+            # Current folder name
+            folder_name = Path(self.current_folder).name
+            self.draw_text(f"📁 {folder_name} ({len(self.gallery_items)} items)", 
+                         gallery_x + 100, nav_y + 3, self.text_color)
+        else:
+            # Folder list title
+            self.draw_text(f"📂 Folders ({len(self.gallery_folders)} folders)", 
+                         gallery_x + 10, nav_y + 3, self.text_color)
+        
+        # Content area
+        content_y = gallery_y + nav_h
+        content_h = gallery_h - nav_h
+        
+        if self.current_folder is None:
+            # Show folder list
+            if len(self.gallery_folders) == 0:
+                no_folders_text = "No recordings found. Start detection and take snapshots or record videos!"
+                self.draw_text(no_folders_text, gallery_x + 10, content_y + 40, (150, 150, 150))
+                return
+            
+            # Folder list
+            y = content_y + 10
+            visible_folders = 0
+            max_visible = int(content_h / 35)
+            
+            for i, folder in enumerate(self.gallery_folders):
+                if i < self.gallery_scroll:
+                    continue
+                
+                if visible_folders >= max_visible:
+                    break
+                
+                # Folder item background
+                item_bg = (45, 45, 45) if i % 2 == 0 else (50, 50, 50)
+                folder_rect = (gallery_x + 10, y, gallery_w - 20, 30)
+                
+                # Check if clicked
+                mouse_x, mouse_y = self.mouse_pos
+                hovered = (gallery_x + 10 <= mouse_x <= gallery_x + gallery_w - 10 and 
+                          y <= mouse_y <= y + 30)
+                
+                if hovered:
+                    item_bg = (70, 70, 70)
+                
+                pygame.draw.rect(self.screen, item_bg, folder_rect)
+                
+                # Folder icon and name
+                self.draw_text("📁", gallery_x + 20, y + 5, self.text_color)
+                self.draw_text(folder['name'], gallery_x + 50, y + 5, self.text_color)
+                
+                # File count
+                count_text = f"{folder['count']} files"
+                self.draw_text(count_text, gallery_x + gallery_w - 120, y + 5, (150, 150, 150))
+                
+                # Click to open folder
+                if hovered and self.mouse_clicked:
+                    self.current_folder = str(folder['path'])
+                    self.gallery_scroll = 0
+                    self.refresh_gallery()
+                
+                y += 35
+                visible_folders += 1
+                
+        else:
+            # Show media thumbnails in current folder
+            if len(self.gallery_items) == 0:
+                no_items_text = "No media files in this folder."
+                self.draw_text(no_items_text, gallery_x + 10, content_y + 40, (150, 150, 150))
+                return
+            
+            # Calculate thumbnail grid
+            thumbnail_size = 100
+            thumbnail_spacing = 10
+            name_height = 20
+            item_height = thumbnail_size + name_height + thumbnail_spacing
+            
+            cols = max(1, (gallery_w - 20) // (thumbnail_size + thumbnail_spacing))
+            rows_visible = max(1, (content_h - 20) // item_height)
+            
+            # Thumbnail grid
+            start_index = self.gallery_scroll * cols
+            
+            for i in range(rows_visible * cols):
+                item_index = start_index + i
+                
+                if item_index >= len(self.gallery_items):
+                    break
+                
+                item = self.gallery_items[item_index]
+                
+                # Calculate position
+                row = i // cols
+                col = i % cols
+                
+                x = gallery_x + 10 + col * (thumbnail_size + thumbnail_spacing)
+                y = content_y + 10 + row * item_height
+                
+                # Thumbnail background
+                thumb_rect = (x, y, thumbnail_size, thumbnail_size)
+                pygame.draw.rect(self.screen, (60, 60, 60), thumb_rect)
+                pygame.draw.rect(self.screen, (100, 100, 100), thumb_rect, 1)
+                
+                # Generate and display thumbnail
+                try:
+                    thumbnail = self.generate_thumbnail(item['path'], (thumbnail_size-4, thumbnail_size-4))
+                    if thumbnail:
+                        thumb_x = x + 2
+                        thumb_y = y + 2
+                        self.screen.blit(thumbnail, (thumb_x, thumb_y))
+                except Exception as e:
+                    # Fallback icon
+                    icon = "🎥" if item['type'] == 'video' else "📸"
+                    icon_surface = self.font_large.render(icon, True, self.text_color)
+                    icon_rect = icon_surface.get_rect(center=(x + thumbnail_size//2, y + thumbnail_size//2))
+                    self.screen.blit(icon_surface, icon_rect)
+                
+                # File name (truncated)
+                name_y = y + thumbnail_size + 2
+                name_text = item['name']
+                if len(name_text) > 15:
+                    name_text = name_text[:12] + "..."
+                
+                name_surface = pygame.font.Font(None, 16).render(name_text, True, self.text_color)
+                name_rect = name_surface.get_rect(center=(x + thumbnail_size//2, name_y + 8))
+                self.screen.blit(name_surface, name_rect)
+                
+                # Click detection
+                mouse_x, mouse_y = self.mouse_pos
+                if (x <= mouse_x <= x + thumbnail_size and 
+                    y <= mouse_y <= y + thumbnail_size + name_height):
+                    
+                    # Highlight on hover
+                    pygame.draw.rect(self.screen, (100, 150, 200), thumb_rect, 2)
+                    
+                    # Click to view
+                    if self.mouse_clicked:
+                        self.selected_media = item
+        
+        # Scroll indicators
+        if self.current_folder is None:
+            max_scroll = max(0, len(self.gallery_folders) - max_visible)
+        else:
+            # Recalculate grid parameters for scroll indicators
+            thumbnail_size = 100
+            thumbnail_spacing = 10
+            items_per_row = max(1, (gallery_w - 20) // (thumbnail_size + thumbnail_spacing))
+            item_height = thumbnail_size + 20 + thumbnail_spacing
+            rows_visible = (content_h - 20) // item_height
+            total_rows = (len(self.gallery_items) + items_per_row - 1) // items_per_row
+            max_scroll = max(0, total_rows - rows_visible)
+        
+        if self.gallery_scroll > 0:
+            self.draw_text("↑ Scroll up (Arrow keys)", gallery_x + 10, content_y - 15, self.yellow)
+        
+        if self.gallery_scroll < max_scroll:
+            self.draw_text("↓ More items below (Arrow keys)", gallery_x + 10, gallery_y + gallery_h - 25, self.yellow)
     
     def draw_button(self, x, y, w, h, text, active=True, style='normal'):
         """Optimized button drawing"""
@@ -289,6 +902,10 @@ class FastImGuiDetector:
                     self.fps = fps
                     self.objects = len(detections)
                     self.total_objects += len(detections)
+                    
+                    # Write frame to video if recording
+                    if self.is_recording and self.video_writer:
+                        self.video_writer.write(frame)
                 
                 # Faster loop
                 time.sleep(0.01)  # 100 Hz
@@ -319,6 +936,9 @@ class FastImGuiDetector:
     def stop_detection(self):
         """Stop detection"""
         self.is_running = False
+        # Stop recording if active
+        if self.is_recording:
+            self.stop_recording()
         if self.cap:
             self.cap.release()
             self.cap = None
@@ -339,14 +959,15 @@ class FastImGuiDetector:
         self.frame_surface = pygame.surfarray.make_surface(frame_flipped)
     
     def render_controls(self):
-        """Minimal control panel"""
+        """Minimal control panel - only shown in monitor tab"""
         panel_x = 10
-        panel_y = 10
+        panel_y = 60  # Below tabs
         panel_w = 280
         # Dynamic height based on content
         base_height = 350
         url_height = 60 if (self.enable_rtsp and self.detector and self.detector.enable_rtsp) else 0
-        panel_h = base_height + url_height
+        recording_height = 35 if self.is_running else 0  # Add space for recording buttons
+        panel_h = base_height + url_height + recording_height
         
         # Panel background
         pygame.draw.rect(self.screen, self.panel_bg, (panel_x, panel_y, panel_w, panel_h))
@@ -431,6 +1052,31 @@ class FastImGuiDetector:
                     print("Stopping...")
                     self.stop_detection()
         y += 40
+        
+        # Recording controls (only show when running)
+        if self.is_running:
+            # Video recording toggle button
+            if not self.is_recording:
+                if self.draw_button(x, y, 95, 25, "🎥 Record", style='normal'):
+                    self.start_recording()
+            else:
+                recording_duration = time.time() - self.recording_start_time if self.recording_start_time else 0
+                button_text = f"⏹️ {recording_duration:.0f}s"
+                if self.draw_button(x, y, 95, 25, button_text, style='error'):
+                    self.stop_recording()
+            
+            # Snapshot button with feedback
+            snap_button_text = "📸 Snap"
+            snap_style = 'normal'
+            
+            # Show different text/style when feedback is active
+            if self.show_snapshot_feedback and time.time() - self.snapshot_feedback_timer < 0.5:
+                snap_button_text = "✅ Saved!"
+                snap_style = 'success'
+            
+            if self.draw_button(x + 105, y, 95, 25, snap_button_text, style=snap_style):
+                self.take_snapshot()
+            y += 35
         
         # HTTP Stream URL (above status)
         if self.enable_rtsp and self.detector and hasattr(self.detector, 'enable_rtsp') and self.detector.enable_rtsp:
@@ -568,12 +1214,22 @@ class FastImGuiDetector:
                 self.screen.blit(feedback_surface, feedback_rect)
             else:
                 self.show_copy_feedback = False
+        
+        # Snapshot feedback (in control panel)
+        if self.show_snapshot_feedback:
+            if time.time() - self.snapshot_feedback_timer < 2.0:  # Show for 2 seconds
+                feedback_text = "📸 Snapshot Saved!"
+                feedback_surface = self.font.render(feedback_text, True, self.green)
+                feedback_rect = feedback_surface.get_rect(center=(x + 100, y + 10))
+                self.screen.blit(feedback_surface, feedback_rect)
+            else:
+                self.show_snapshot_feedback = False
     
     def render_video(self):
         """Fast video rendering with large display"""
         # Video area - most of the screen
         video_x = 300  # Leave space for control panel
-        video_y = 10
+        video_y = 60  # Below tabs
         available_width = self.screen_width - video_x - 10
         available_height = self.screen_height - video_y - 10
         
@@ -622,6 +1278,24 @@ class FastImGuiDetector:
         # Optional: Draw border around video for clarity
         border_color = (100, 100, 100)
         pygame.draw.rect(self.screen, border_color, (center_x-1, center_y-1, new_w+2, new_h+2), 1)
+        
+        # Snapshot feedback overlay on video
+        if self.show_snapshot_feedback:
+            if time.time() - self.snapshot_feedback_timer < 2.0:
+                # Large, prominent feedback on video area
+                feedback_text = "📸 SNAPSHOT SAVED!"
+                feedback_surface = self.font_large.render(feedback_text, True, self.green)
+                feedback_bg = pygame.Surface((feedback_surface.get_width() + 20, feedback_surface.get_height() + 10))
+                feedback_bg.fill((0, 0, 0))
+                feedback_bg.set_alpha(180)
+                
+                # Position at top of video area
+                feedback_x = center_x + (new_w - feedback_surface.get_width()) // 2
+                feedback_y = center_y + 20
+                
+                # Draw background and text
+                self.screen.blit(feedback_bg, (feedback_x - 10, feedback_y - 5))
+                self.screen.blit(feedback_surface, (feedback_x, feedback_y))
     
     def run(self):
         """Optimized main loop"""
@@ -661,6 +1335,12 @@ class FastImGuiDetector:
                     if event.key == pygame.K_ESCAPE:
                         if self.is_initializing:
                             continue  # Don't allow exit during initialization
+                        elif self.selected_media:
+                            self.selected_media = None  # Close media viewer
+                        elif self.current_folder and self.current_tab == 'gallery':
+                            self.current_folder = None  # Go back to folder list
+                            self.gallery_scroll = 0
+                            self.refresh_gallery()
                         elif self.is_fullscreen:
                             self.toggle_fullscreen()  # Exit fullscreen first
                         else:
@@ -671,6 +1351,34 @@ class FastImGuiDetector:
                     elif event.key == pygame.K_f:
                         if not self.is_initializing:
                             self.toggle_fullscreen()
+                    elif event.key == pygame.K_UP:
+                        # Scroll up in gallery
+                        if self.current_tab == 'gallery' and self.gallery_scroll > 0:
+                            self.gallery_scroll -= 1
+                    elif event.key == pygame.K_DOWN:
+                        # Scroll down in gallery
+                        if self.current_tab == 'gallery':
+                            # Calculate proper max scroll based on current view
+                            if self.current_folder is None:
+                                # Folder view
+                                content_h = self.screen_height - 60 - 40  # Screen minus tabs minus nav
+                                max_visible = int(content_h / 35)
+                                max_scroll = max(0, len(self.gallery_folders) - max_visible)
+                            else:
+                                # Thumbnail view
+                                gallery_w = self.screen_width - 20
+                                thumbnail_size = 100
+                                thumbnail_spacing = 10
+                                item_height = thumbnail_size + 20 + thumbnail_spacing
+                                
+                                cols = max(1, (gallery_w - 20) // (thumbnail_size + thumbnail_spacing))
+                                content_h = self.screen_height - 60 - 40
+                                rows_visible = (content_h - 20) // item_height
+                                total_rows = (len(self.gallery_items) + cols - 1) // cols
+                                max_scroll = max(0, total_rows - rows_visible)
+                            
+                            if self.gallery_scroll < max_scroll:
+                                self.gallery_scroll += 1
             
             # Clear screen
             self.screen.fill(self.bg_dark)
@@ -680,14 +1388,27 @@ class FastImGuiDetector:
                 self.render_loading_screen()
             else:
                 # Normal UI
-                # Update video surface (throttled to 15 FPS for GUI)
-                if current_time - last_video_update > 0.066:  # ~15 FPS GUI updates
-                    self.update_video_surface()
-                    last_video_update = current_time
+                # Always render tabs
+                self.render_tabs()
                 
-                # Render UI (fast)
-                self.render_controls()
-                self.render_video()
+                if self.current_tab == 'monitor':
+                    # Monitor tab - show detection interface
+                    # Update video surface (throttled to 15 FPS for GUI)
+                    if current_time - last_video_update > 0.066:  # ~15 FPS GUI updates
+                        self.update_video_surface()
+                        last_video_update = current_time
+                    
+                    # Render UI (fast)
+                    self.render_controls()
+                    self.render_video()
+                    
+                elif self.current_tab == 'gallery':
+                    # Gallery tab - show media files
+                    self.render_gallery()
+            
+            # Media viewer overlay (renders on top of everything)
+            if self.selected_media:
+                self.render_media_viewer()
             
             # Update display
             pygame.display.flip()
