@@ -132,20 +132,31 @@ class PyTorchGPUDetector:
         for detection in detections:
             x, y, w, h, conf, class_id = detection
             
-            # Get color and name
-            color = self.colors.get(class_id, (0, 255, 0))
+            # Get color and name (dimmed colors for transparency effect)
+            base_color = self.colors.get(class_id, (0, 255, 0))
+            # Dim the colors by reducing intensity
+            color = tuple(int(c * 0.8) for c in base_color)
             name = self.class_names.get(class_id, f"Class_{class_id}")
             
-            # Draw bounding box
-            cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+            # Create overlay for transparency effect
+            overlay = frame.copy()
+            
+            # Draw bounding box with thinner line (thickness 1)
+            cv2.rectangle(overlay, (x, y), (x + w, y + h), color, 1)
             
             # Draw label with background
             label = f"{name}: {conf:.2f}"
-            label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-            cv2.rectangle(frame, (x, y - label_size[1] - 10), 
-                         (x + label_size[0], y), color, -1)
-            cv2.putText(frame, label, (x, y - 5), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+            cv2.rectangle(overlay, (x, y - label_size[1] - 10), 
+                         (x + label_size[0] + 10, y), color, -1)
+            
+            # Apply transparency (alpha blend)
+            alpha = 0.7  # 70% opacity, 30% transparency
+            cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+            
+            # Draw label text (opaque for readability)
+            cv2.putText(frame, label, (x + 5, y - 5), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
         return frame
     

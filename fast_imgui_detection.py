@@ -6,6 +6,8 @@ import threading
 import time
 import argparse
 import os
+import json
+import csv
 from datetime import datetime
 from pathlib import Path
 from pytorch_gpu_detection import PyTorchGPUDetector, get_local_ip, get_stream_url
@@ -20,7 +22,7 @@ class FastImGuiDetector:
         self.screen_width = 1200
         self.screen_height = 800
         self.is_fullscreen = False
-        self.screen = pygame.display.set_mode((self.screen_width, self.screen_height))
+        self.screen = pygame.display.set_mode((self.screen_width, self.screen_height), pygame.RESIZABLE)
         pygame.display.set_caption("Fast Object Detection - ImGui Style")
         
         # Simple font
@@ -67,10 +69,16 @@ class FastImGuiDetector:
         self.objects = 0
         self.total_objects = 0
         
-        # Recording functionality
+        # Recording functionality - frame sharing approach
         self.is_recording = False
-        self.video_writer = None
+        self.recording_thread = None
         self.recording_start_time = None
+        self.detection_log_file = None
+        self.detection_data = []
+        self.recording_frame_count = 0
+        self.recording_should_stop = False
+        self.shared_recording_frame = None
+        self.recording_frame_lock = threading.Lock()
         
         # Snapshot feedback
         self.show_snapshot_feedback = False
@@ -121,52 +129,331 @@ class FastImGuiDetector:
         
         print(f"📁 Recording directory: {self.today_dir}")
     
-    def get_timestamp_filename(self, prefix, extension):
-        """Generate timestamp-based filename with prefix"""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        return f"{prefix}_{timestamp}.{extension}"
+    def get_timestamp_filename(self, file_type, extension):
+        """Generate filename with format: [type]_[date]_[time]_[timestamp]"""
+        now = datetime.now()
+        date_str = now.strftime("%Y-%m-%d")  # 2025-09-05
+        time_str = now.strftime("%H-%M-%S")  # 14-30-22
+        timestamp = int(now.timestamp())
+        return f"{file_type}_{date_str}_{time_str}_{timestamp}.{extension}"
     
     def start_recording(self):
-        """Start video recording"""
-        if not self.current_frame is None and not self.is_recording:
+        """Start completely independent video recording thread"""
+        if not self.is_recording:
             # Ensure directory exists for today
             today = datetime.now().strftime("%Y-%m-%d")
             today_dir = Path("recordings") / today
             today_dir.mkdir(exist_ok=True)
             
-            # Generate filename
-            filename = self.get_timestamp_filename("video", "mp4")
-            filepath = today_dir / filename
+            # Generate filename with new format
+            video_filename = self.get_timestamp_filename("video", "avi")
+            base_name = video_filename.replace(".avi", "")
             
-            # Get frame dimensions
-            h, w = self.current_frame.shape[:2]
+            # File paths
+            video_filepath = today_dir / video_filename
+            detection_filepath = today_dir / f"{base_name}_detections.json"
             
-            # Initialize video writer with MP4 format
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            self.video_writer = cv2.VideoWriter(str(filepath), fourcc, 20.0, (w, h))
+            # Initialize recording state
+            self.detection_log_file = str(detection_filepath)
+            self.detection_data = []
+            self.recording_frame_count = 0
+            self.recording_should_stop = False
+            self.is_recording = True
+            self.recording_start_time = time.time()
             
-            if self.video_writer.isOpened():
-                self.is_recording = True
-                self.recording_start_time = time.time()
-                print(f"🎥 Started recording: {filepath}")
+            # Start completely independent recording thread
+            self.recording_thread = threading.Thread(
+                target=self.independent_recording_worker, 
+                args=(video_filepath,), 
+                daemon=True
+            )
+            self.recording_thread.start()
+            
+            print(f"🎥 Started independent recording: {video_filepath}")
+            print(f"📊 Detection logging: {detection_filepath}")
+            return True
+        return False
+    
+    def independent_recording_worker(self, video_filepath):
+        """Recording thread using shared frames to avoid camera conflicts"""
+        print("🎬 Frame-sharing recording thread started")
+        
+        video_writer = None
+        frame_count = 0
+        last_frame_time = time.time()
+        target_fps = 20.0
+        frame_interval = 1.0 / target_fps
+        
+        try:
+            # Wait for first shared frame
+            while self.is_recording and self.shared_recording_frame is None:
+                time.sleep(0.01)
+            
+            if not self.is_recording:
+                return
+            
+            # Get frame dimensions from first shared frame
+            with self.recording_frame_lock:
+                if self.shared_recording_frame is not None:
+                    h, w = self.shared_recording_frame.shape[:2]
+                else:
+                    print("❌ No shared frame available")
+                    return
+            
+            # Try different codecs with better debugging
+            codecs_to_try = [
+                ('XVID', cv2.VideoWriter_fourcc(*'XVID')),
+                ('MJPG', cv2.VideoWriter_fourcc(*'MJPG')),
+                ('mp4v', cv2.VideoWriter_fourcc(*'mp4v')),
+                ('YUYV', cv2.VideoWriter_fourcc(*'YUYV')),
+                ('I420', cv2.VideoWriter_fourcc(*'I420')),
+                ('raw ', cv2.VideoWriter_fourcc(*'raw ')),
+            ]
+            
+            print(f"🎥 Trying to create video writer for {w}x{h} at {target_fps}fps")
+            
+            for codec_name, fourcc in codecs_to_try:
+                print(f"🔧 Trying codec: {codec_name}")
+                video_writer = cv2.VideoWriter(str(video_filepath), fourcc, target_fps, (w, h))
+                
+                if video_writer.isOpened():
+                    print(f"✅ Video writer opened with codec: {codec_name}")
+                    # Test write a dummy frame
+                    test_frame = self.shared_recording_frame.copy()
+                    test_result = video_writer.write(test_frame)
+                    if test_result:
+                        print(f"✅ Test frame write successful with {codec_name}")
+                        break
+                    else:
+                        print(f"❌ Test frame write failed with {codec_name}")
+                        video_writer.release()
+                        video_writer = None
+                else:
+                    print(f"❌ Failed to open video writer with {codec_name}")
+                    if video_writer:
+                        video_writer.release()
+                        video_writer = None
+            
+            if not video_writer or not video_writer.isOpened():
+                print("❌ All video codecs failed, trying image sequence fallback...")
+                # Create directory for image sequence
+                import os
+                img_seq_dir = str(video_filepath).replace('.avi', '_frames')
+                os.makedirs(img_seq_dir, exist_ok=True)
+                print(f"📁 Saving image sequence to: {img_seq_dir}")
+                video_writer = "image_sequence"  # Special marker
+            else:
+                img_seq_dir = None
+            
+            print(f"📐 Recording dimensions: {w}x{h}")
+            
+            # Recording loop using shared frames
+            while self.is_recording and not self.recording_should_stop:
+                current_time = time.time()
+                
+                # Maintain target FPS
+                if current_time - last_frame_time >= frame_interval:
+                    # Get shared frame
+                    frame_to_record = None
+                    with self.recording_frame_lock:
+                        if self.shared_recording_frame is not None:
+                            frame_to_record = self.shared_recording_frame.copy()
+                    
+                    if frame_to_record is not None:
+                        # Validate frame before writing
+                        if frame_to_record.shape[:2] == (h, w) and len(frame_to_record.shape) == 3:
+                            # Ensure frame is in correct format (BGR)
+                            if frame_to_record.dtype != np.uint8:
+                                frame_to_record = frame_to_record.astype(np.uint8)
+                            
+                            success = False
+                            
+                            if video_writer == "image_sequence":
+                                # Save as image sequence
+                                img_filename = f"frame_{frame_count:06d}.jpg"
+                                img_path = os.path.join(img_seq_dir, img_filename)
+                                success = cv2.imwrite(img_path, frame_to_record)
+                                if not success:
+                                    print(f"⚠️ Failed to save image {img_filename}")
+                            else:
+                                # Write to video file
+                                success = video_writer.write(frame_to_record)
+                                
+                                # If video writing fails, switch to image sequence
+                                if not success and frame_count == 0:
+                                    print(f"❌ Video writing failed, switching to image sequence mode")
+                                    # Close current video writer
+                                    video_writer.release()
+                                    
+                                    # Setup image sequence
+                                    import os
+                                    img_seq_dir = str(video_filepath).replace('.avi', '_frames')
+                                    os.makedirs(img_seq_dir, exist_ok=True)
+                                    video_writer = "image_sequence"
+                                    print(f"📁 Switched to image sequence: {img_seq_dir}")
+                                    
+                                    # Save current frame as first image
+                                    img_filename = f"frame_{frame_count:06d}.jpg"
+                                    img_path = os.path.join(img_seq_dir, img_filename)
+                                    success = cv2.imwrite(img_path, frame_to_record)
+                            
+                            if success:
+                                frame_count += 1
+                                self.recording_frame_count = frame_count
+                                last_frame_time = current_time
+                                
+                                # Progress every 60 frames (3 seconds at 20fps)
+                                if frame_count % 60 == 0:
+                                    method = "image sequence" if video_writer == "image_sequence" else "video file"
+                                    print(f"📹 Recorded {frame_count} frames via {method}")
+                            else:
+                                method_info = f"image sequence to {img_seq_dir}" if video_writer == "image_sequence" else f"video file - format: {frame_to_record.shape}, dtype: {frame_to_record.dtype}"
+                                print(f"⚠️ Failed to write frame {frame_count} - {method_info}")
+                        else:
+                            print(f"⚠️ Invalid frame dimensions: got {frame_to_record.shape}, expected ({h}, {w}, 3)")
+                    else:
+                        # No frame available, wait
+                        time.sleep(0.001)
+                else:
+                    # Sleep until next frame time
+                    sleep_time = frame_interval - (current_time - last_frame_time)
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
+            
+            print(f"🎬 Frame-sharing recording completed: {frame_count} frames")
+            
+        except Exception as e:
+            print(f"❌ Frame-sharing recording error: {e}")
+        
+        finally:
+            # Cleanup
+            if video_writer and video_writer != "image_sequence":
+                video_writer.release()
+            
+            # Create video from image sequence if needed
+            if video_writer == "image_sequence" and frame_count > 0:
+                print(f"🎬 Converting {frame_count} images to video...")
+                try:
+                    self.convert_image_sequence_to_video(img_seq_dir, video_filepath, target_fps)
+                except Exception as e:
+                    print(f"⚠️ Failed to convert image sequence: {e}")
+                    print(f"📁 Raw frames saved in: {img_seq_dir}")
+            
+            print("🎬 Frame-sharing recording thread stopped")
+    
+    def convert_image_sequence_to_video(self, img_seq_dir, output_video_path, fps):
+        """Convert image sequence to video using ffmpeg or OpenCV"""
+        try:
+            import subprocess
+            import glob
+            
+            # Try using ffmpeg first (more reliable)
+            ffmpeg_cmd = [
+                'ffmpeg', '-y',  # -y to overwrite
+                '-framerate', str(fps),
+                '-i', f'{img_seq_dir}/frame_%06d.jpg',
+                '-c:v', 'libx264',
+                '-pix_fmt', 'yuv420p',
+                str(output_video_path)
+            ]
+            
+            print(f"🎬 Converting with ffmpeg: {' '.join(ffmpeg_cmd)}")
+            result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=30)
+            
+            if result.returncode == 0:
+                print(f"✅ Successfully converted to video: {output_video_path}")
+                # Clean up image sequence
+                import shutil
+                shutil.rmtree(img_seq_dir)
+                print(f"🗑️ Cleaned up temporary frames")
                 return True
             else:
-                print("❌ Failed to start recording")
-                return False
+                print(f"❌ ffmpeg failed: {result.stderr}")
+                
+        except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
+            print(f"❌ ffmpeg conversion failed: {e}")
+        
+        # Fallback: leave image sequence
+        print(f"📁 Image sequence preserved at: {img_seq_dir}")
+        print(f"💡 To convert manually: ffmpeg -framerate {fps} -i {img_seq_dir}/frame_%06d.jpg -c:v libx264 -pix_fmt yuv420p {output_video_path}")
         return False
     
     def stop_recording(self):
-        """Stop video recording"""
-        if self.is_recording and self.video_writer:
-            self.video_writer.release()
-            self.video_writer = None
+        """Stop independent video recording and save detection data"""
+        if self.is_recording:
+            print("⏹️ Stopping independent recording...")
+            self.recording_should_stop = True
             self.is_recording = False
+            
+            # Wait for independent recording thread to finish
+            if self.recording_thread and self.recording_thread.is_alive():
+                print("⏳ Waiting for recording thread to finish...")
+                self.recording_thread.join(timeout=3.0)  # Wait max 3 seconds
+            
             duration = time.time() - self.recording_start_time if self.recording_start_time else 0
-            print(f"⏹️ Recording stopped (duration: {duration:.1f}s)")
+            
+            # Save detection data to JSON file
+            if self.detection_log_file and self.detection_data:
+                try:
+                    detection_summary = {
+                        "video_info": {
+                            "duration_seconds": duration,
+                            "fps": 20.0,  # Recording FPS
+                            "total_frames": len([d for d in self.detection_data if d.get('frame_number')]),
+                            "recording_start": datetime.fromtimestamp(self.recording_start_time).isoformat(),
+                            "recording_end": datetime.now().isoformat()
+                        },
+                        "detections": self.detection_data
+                    }
+                    
+                    with open(self.detection_log_file, 'w') as f:
+                        json.dump(detection_summary, f, indent=2)
+                    
+                    print(f"📊 Detection data saved: {self.detection_log_file}")
+                    print(f"📈 Total detections logged: {len(self.detection_data)}")
+                    
+                    # Also create CSV version for easy analysis
+                    csv_file = self.detection_log_file.replace('.json', '.csv')
+                    self.export_detections_to_csv(csv_file)
+                    
+                except Exception as e:
+                    print(f"❌ Error saving detection data: {e}")
+            
             self.recording_start_time = None
+            self.detection_log_file = None
+            self.detection_data = []
+            self.recording_frame_count = 0
+            self.recording_should_stop = False
+            self.recording_thread = None
+            
+            # Clean up shared frame
+            with self.recording_frame_lock:
+                self.shared_recording_frame = None
+            
+            print(f"⏹️ Recording stopped (duration: {duration:.1f}s)")
+            
             # Refresh gallery if we're in gallery tab
             if self.current_tab == 'gallery':
                 self.refresh_gallery()
+    
+    def export_detections_to_csv(self, csv_file):
+        """Export detection data to CSV format"""
+        try:
+            with open(csv_file, 'w', newline='') as f:
+                if not self.detection_data:
+                    return
+                
+                # Get fieldnames from first detection
+                fieldnames = ['timestamp', 'frame_number', 'object_type', 'confidence', 'x1', 'y1', 'x2', 'y2', 'center_x', 'center_y', 'width', 'height']
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                
+                for detection in self.detection_data:
+                    writer.writerow(detection)
+                
+            print(f"📊 CSV exported: {csv_file}")
+        except Exception as e:
+            print(f"❌ Error exporting CSV: {e}")
     
     def take_snapshot(self):
         """Take a snapshot image"""
@@ -176,7 +463,7 @@ class FastImGuiDetector:
             today_dir = Path("recordings") / today
             today_dir.mkdir(exist_ok=True)
             
-            # Generate filename
+            # Generate filename with new format
             filename = self.get_timestamp_filename("image", "jpg")
             filepath = today_dir / filename
             
@@ -208,11 +495,13 @@ class FastImGuiDetector:
         # Scan all date directories for folder list
         for date_dir in sorted(recordings_dir.glob("*"), reverse=True):  # Most recent first
             if date_dir.is_dir():
-                # Count media files in this folder
+                # Count media files in this folder (both new and legacy formats)
                 media_count = 0
-                media_count += len(list(date_dir.glob("image_*.jpg")))
-                media_count += len(list(date_dir.glob("video_*.mp4")))
-                media_count += len(list(date_dir.glob("video_*.avi")))
+                media_count += len(list(date_dir.glob("image_*.jpg")))      # New format
+                media_count += len(list(date_dir.glob("video_*.mp4")))      # New format
+                media_count += len(list(date_dir.glob("video_*.avi")))      # New format
+                media_count += len(list(date_dir.glob("recording_*.mp4")))  # Legacy
+                media_count += len(list(date_dir.glob("recording_*.avi")))  # Legacy
                 
                 if media_count > 0:
                     folder_info = {
@@ -229,16 +518,21 @@ class FastImGuiDetector:
             if folder_path.exists():
                 media_files = []
                 
-                # Add images
-                for img_file in folder_path.glob("image_*.jpg"):
+                # Add images (all formats: new with dashes, legacy)
+                for img_file in folder_path.glob("image_*.jpg"):  # All image files
                     media_files.append(img_file)
                 
-                # Add videos  
-                for video_file in folder_path.glob("video_*.mp4"):
+                # Add videos (both old and new format)
+                for video_file in folder_path.glob("video_*.mp4"):  # New format: video_YYYYMMDD_HHMMSS_timestamp.mp4
+                    media_files.append(video_file)
+                for video_file in folder_path.glob("video_*.avi"):  # New format: video_YYYYMMDD_HHMMSS_timestamp.avi
                     media_files.append(video_file)
                 
-                for video_file in folder_path.glob("video_*.avi"):
-                    media_files.append(video_file)
+                # Legacy formats
+                for recording_file in folder_path.glob("recording_*.mp4"):  # Legacy
+                    media_files.append(recording_file)
+                for recording_file in folder_path.glob("recording_*.avi"):  # Legacy
+                    media_files.append(recording_file)
                 
                 # Sort files by modification time (newest first)
                 media_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
@@ -260,10 +554,22 @@ class FastImGuiDetector:
     
     def generate_thumbnail(self, file_path, size=(80, 80)):
         """Generate thumbnail for image or video file"""
-        cache_key = f"{file_path}_{size[0]}x{size[1]}"
+        try:
+            cache_key = f"{file_path}_{size[0]}x{size[1]}"
+            
+            if cache_key in self.thumbnail_cache:
+                return self.thumbnail_cache[cache_key]
+            
+            # Limit cache size to prevent memory issues
+            if len(self.thumbnail_cache) > 100:
+                # Remove oldest entries
+                old_keys = list(self.thumbnail_cache.keys())[:20]
+                for key in old_keys:
+                    del self.thumbnail_cache[key]
         
-        if cache_key in self.thumbnail_cache:
-            return self.thumbnail_cache[cache_key]
+        except Exception as e:
+            print(f"❌ Error managing thumbnail cache: {e}")
+            return None
         
         try:
             if file_path.suffix.lower() in ['.jpg', '.jpeg', '.png']:
@@ -288,10 +594,18 @@ class FastImGuiDetector:
                     x_offset = (size[0] - new_w) // 2
                     thumbnail[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = img_resized
                     
-                    # Convert to pygame surface
-                    thumbnail_rotated = np.rot90(thumbnail)
-                    thumbnail_flipped = np.flipud(thumbnail_rotated)
-                    surface = pygame.surfarray.make_surface(thumbnail_flipped)
+                    # Convert to pygame surface with safety checks
+                    if thumbnail is not None and thumbnail.size > 0:
+                        thumbnail_rotated = np.rot90(thumbnail)
+                        thumbnail_flipped = np.flipud(thumbnail_rotated)
+                        
+                        # Ensure array is contiguous and proper format
+                        if not thumbnail_flipped.flags['C_CONTIGUOUS']:
+                            thumbnail_flipped = np.ascontiguousarray(thumbnail_flipped)
+                        
+                        surface = pygame.surfarray.make_surface(thumbnail_flipped)
+                    else:
+                        return None
                     
                     self.thumbnail_cache[cache_key] = surface
                     return surface
@@ -299,10 +613,19 @@ class FastImGuiDetector:
             elif file_path.suffix.lower() in ['.mp4', '.avi']:
                 # Video thumbnail - get first frame
                 cap = cv2.VideoCapture(str(file_path))
-                ret, frame = cap.read()
-                cap.release()
+                try:
+                    if not cap.isOpened():
+                        print(f"❌ Cannot open video for thumbnail: {file_path}")
+                        return None
+                    
+                    ret, frame = cap.read()
+                    if not ret or frame is None:
+                        print(f"❌ Cannot read frame for thumbnail: {file_path}")
+                        return None
+                finally:
+                    cap.release()
                 
-                if ret:
+                if ret and frame is not None:
                     img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     h, w = img_rgb.shape[:2]
                     
@@ -321,10 +644,18 @@ class FastImGuiDetector:
                     x_offset = (size[0] - new_w) // 2
                     thumbnail[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = img_resized
                     
-                    # Convert to pygame surface
-                    thumbnail_rotated = np.rot90(thumbnail)
-                    thumbnail_flipped = np.flipud(thumbnail_rotated)
-                    surface = pygame.surfarray.make_surface(thumbnail_flipped)
+                    # Convert to pygame surface with safety checks
+                    if thumbnail is not None and thumbnail.size > 0:
+                        thumbnail_rotated = np.rot90(thumbnail)
+                        thumbnail_flipped = np.flipud(thumbnail_rotated)
+                        
+                        # Ensure array is contiguous and proper format
+                        if not thumbnail_flipped.flags['C_CONTIGUOUS']:
+                            thumbnail_flipped = np.ascontiguousarray(thumbnail_flipped)
+                        
+                        surface = pygame.surfarray.make_surface(thumbnail_flipped)
+                    else:
+                        return None
                     
                     self.thumbnail_cache[cache_key] = surface
                     return surface
@@ -413,9 +744,19 @@ class FastImGuiDetector:
             elif self.selected_media['type'] == 'video':
                 # Display video info and first frame as preview
                 cap = cv2.VideoCapture(str(file_path))
-                ret, frame = cap.read()
+                try:
+                    if not cap.isOpened():
+                        print(f"❌ Cannot open video for preview: {file_path}")
+                        return
+                    
+                    ret, frame = cap.read()
+                    if not ret or frame is None:
+                        print(f"❌ Cannot read frame for preview: {file_path}")
+                        return
+                finally:
+                    cap.release()
                 
-                if ret:
+                if ret and frame is not None:
                     img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     h, w = img_rgb.shape[:2]
                     
@@ -459,8 +800,6 @@ class FastImGuiDetector:
                     
                     self.screen.blit(play_surface, (icon_x, icon_y))
                 
-                cap.release()
-                
         except Exception as e:
             # Error display
             error_text = f"Error loading media: {e}"
@@ -480,12 +819,57 @@ class FastImGuiDetector:
         button_y = info_y + 30
         if self.selected_media['type'] == 'video':
             if self.draw_button(viewer_x + 10, button_y, 120, 25, "🎬 Play in Player", style='normal'):
-                # Try to open with default video player
+                # Try to open with custom detection video player
                 try:
-                    import subprocess
-                    subprocess.Popen(['xdg-open', str(self.selected_media['path'])], start_new_session=True)
+                    if self.selected_media and self.selected_media.get('path'):
+                        import subprocess
+                        player_script = Path(__file__).parent / "video_player.py"
+                        video_path = str(self.selected_media['path'])
+                        
+                        if Path(video_path).exists():
+                            subprocess.Popen(['python3', str(player_script), video_path], start_new_session=True)
+                            print(f"🎬 Opening video in detection player: {self.selected_media.get('name', 'unknown')}")
+                        else:
+                            print(f"❌ Video file not found: {video_path}")
+                    else:
+                        print("❌ No media selected or invalid path")
+                        
                 except Exception as e:
-                    print(f"❌ Error opening video: {e}")
+                    print(f"❌ Error opening video player: {e}")
+                    # Fallback to system player
+                    try:
+                        if self.selected_media and self.selected_media.get('path'):
+                            subprocess.Popen(['xdg-open', str(self.selected_media['path'])], start_new_session=True)
+                    except Exception as e2:
+                        print(f"❌ Error opening with system player: {e2}")
+            
+            # Check if this is a recording with detection data
+            file_path = self.selected_media['path']
+            
+            # Handle both new and legacy detection file naming
+            file_stem = str(file_path).replace('.mp4', '').replace('.avi', '')
+            detection_file = f"{file_stem}_detections.json"
+            if Path(detection_file).exists():
+                if self.draw_button(viewer_x + 140, button_y, 130, 25, "📊 View Detections", style='success'):
+                    try:
+                        import subprocess
+                        # Open detection JSON file with default editor
+                        subprocess.Popen(['xdg-open', detection_file], start_new_session=True)
+                    except Exception as e:
+                        print(f"❌ Error opening detections: {e}")
+                
+                # Show detection summary
+                try:
+                    with open(detection_file, 'r') as f:
+                        detection_data = json.load(f)
+                    
+                    total_detections = len(detection_data.get('detections', []))
+                    duration = detection_data.get('video_info', {}).get('duration_seconds', 0)
+                    
+                    summary_text = f"📊 Detections: {total_detections} | Duration: {duration:.1f}s"
+                    self.draw_text(summary_text, viewer_x + 280, button_y + 5, self.yellow)
+                except:
+                    pass
         
         # Delete button (with confirmation needed)
         if self.draw_button(viewer_x + viewer_w - 120, button_y, 110, 25, "🗑️ Delete File", style='error'):
@@ -637,17 +1021,27 @@ class FastImGuiDetector:
                 
                 # Generate and display thumbnail
                 try:
-                    thumbnail = self.generate_thumbnail(item['path'], (thumbnail_size-4, thumbnail_size-4))
-                    if thumbnail:
-                        thumb_x = x + 2
-                        thumb_y = y + 2
-                        self.screen.blit(thumbnail, (thumb_x, thumb_y))
+                    if item and item.get('path'):
+                        thumbnail = self.generate_thumbnail(item['path'], (thumbnail_size-4, thumbnail_size-4))
+                        if thumbnail:
+                            thumb_x = x + 2
+                            thumb_y = y + 2
+                            self.screen.blit(thumbnail, (thumb_x, thumb_y))
+                        else:
+                            raise Exception("Thumbnail generation failed")
+                    else:
+                        raise Exception("Invalid item or path")
+                        
                 except Exception as e:
                     # Fallback icon
-                    icon = "🎥" if item['type'] == 'video' else "📸"
-                    icon_surface = self.font_large.render(icon, True, self.text_color)
-                    icon_rect = icon_surface.get_rect(center=(x + thumbnail_size//2, y + thumbnail_size//2))
-                    self.screen.blit(icon_surface, icon_rect)
+                    try:
+                        icon = "🎥" if item.get('type') == 'video' else "📸"
+                        icon_surface = self.font_large.render(icon, True, self.text_color)
+                        icon_rect = icon_surface.get_rect(center=(x + thumbnail_size//2, y + thumbnail_size//2))
+                        self.screen.blit(icon_surface, icon_rect)
+                    except:
+                        # Ultimate fallback - draw a rectangle
+                        pygame.draw.rect(self.screen, (100, 100, 100), (x+10, y+10, thumbnail_size-20, thumbnail_size-20))
                 
                 # File name (truncated)
                 name_y = y + thumbnail_size + 2
@@ -740,7 +1134,7 @@ class FastImGuiDetector:
             # Switch back to windowed
             self.screen_width = self.windowed_width
             self.screen_height = self.windowed_height
-            self.screen = pygame.display.set_mode((self.screen_width, self.screen_height))
+            self.screen = pygame.display.set_mode((self.screen_width, self.screen_height), pygame.RESIZABLE)
             print(f"🪟 Windowed: {self.screen_width}x{self.screen_height}")
     
     def draw_text(self, text, x, y, color=None):
@@ -875,37 +1269,103 @@ class FastImGuiDetector:
     
     def detection_loop(self):
         """Minimal overhead detection loop"""
+        frame_number = 0
+        
         while self.is_running:
             try:
                 ret, frame = self.cap.read()
-                if not ret:
+                if not ret or frame is None:
                     continue
+                
+                # Validate frame data
+                if frame.size == 0:
+                    continue
+                
+                # Share original frame for recording (minimal overhead)
+                if self.is_recording:
+                    with self.recording_frame_lock:
+                        self.shared_recording_frame = frame.copy()
                 
                 # Detection
                 detections, inf_time = self.detector.detect_objects(frame)
                 fps = 1.0 / inf_time if inf_time > 0 else 0
                 
-                # Draw detections
-                if self.show_detections:
-                    frame = self.detector.draw_detections(frame, detections)
+                # Log detection data if recording (minimal impact)
+                if self.is_recording and detections:
+                    current_time = time.time()
+                    relative_time = current_time - self.recording_start_time
+                    
+                    for detection in detections:
+                        try:
+                            # Handle different detection formats
+                            if isinstance(detection, dict):
+                                # Dictionary format
+                                if 'bbox' in detection:
+                                    x1, y1, x2, y2 = map(int, detection['bbox'])
+                                else:
+                                    # Try direct coordinates
+                                    x1, y1, x2, y2 = int(detection.get('x1', 0)), int(detection.get('y1', 0)), int(detection.get('x2', 0)), int(detection.get('y2', 0))
+                                
+                                obj_class = detection.get('class', detection.get('name', 'unknown'))
+                                confidence = float(detection.get('confidence', detection.get('conf', 0.0)))
+                            else:
+                                # List/tuple format [x1, y1, x2, y2, conf, class_id]
+                                if len(detection) >= 4:
+                                    x1, y1, x2, y2 = map(int, detection[:4])
+                                    confidence = float(detection[4]) if len(detection) > 4 else 0.0
+                                    obj_class = str(detection[5]) if len(detection) > 5 else 'unknown'
+                                else:
+                                    continue  # Skip invalid detections
+                            
+                            center_x = (x1 + x2) // 2
+                            center_y = (y1 + y2) // 2
+                            width = x2 - x1
+                            height = y2 - y1
+                            
+                            detection_entry = {
+                                'timestamp': relative_time,
+                                'frame_number': frame_number,
+                                'object_type': obj_class,
+                                'confidence': confidence,
+                                'x1': x1,
+                                'y1': y1,
+                                'x2': x2,
+                                'y2': y2,
+                                'center_x': center_x,
+                                'center_y': center_y,
+                                'width': width,
+                                'height': height
+                            }
+                            self.detection_data.append(detection_entry)
+                        except Exception as e:
+                            print(f"⚠️ Error processing detection: {e}")
+                            continue
                 
-                # Add minimal GUI info
+                # Draw detections for display (not for recording)
+                if self.show_detections and detections:
+                    display_frame = self.detector.draw_detections(frame.copy(), detections)
+                else:
+                    display_frame = frame  # Use original frame if no detections to show
+                
+                # Add minimal GUI info to display frame only
                 if self.show_gui_info:
-                    cv2.putText(frame, f"FPS: {fps:.1f}", (10, 25), 
+                    cv2.putText(display_frame, f"FPS: {fps:.1f}", (10, 25), 
                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
-                    cv2.putText(frame, f"Objects: {len(detections)}", (10, 45), 
+                    cv2.putText(display_frame, f"Objects: {len(detections)}", (10, 45), 
                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+                    if self.is_recording:
+                        cv2.putText(display_frame, f"REC", (10, 65), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
                 
-                # Update (minimal locking)
+                # Update (minimal locking) - separate display and recording
                 with self.frame_lock:
-                    self.current_frame = frame
+                    self.current_frame = display_frame  # Display frame with detections
                     self.fps = fps
                     self.objects = len(detections)
                     self.total_objects += len(detections)
-                    
-                    # Write frame to video if recording
-                    if self.is_recording and self.video_writer:
-                        self.video_writer.write(frame)
+                
+                # No video frame handling in main loop - recording is completely independent
+                frame_number += 1
                 
                 # Faster loop
                 time.sleep(0.01)  # 100 Hz
@@ -1116,6 +1576,17 @@ class FastImGuiDetector:
         self.draw_text(f"Objects: {self.objects}", x, y)
         y += 15
         self.draw_text(f"Total: {self.total_objects}", x, y)
+        y += 15
+        
+        # Independent recording status
+        if self.is_recording:
+            logged_count = len(self.detection_data)
+            self.draw_text(f"Logged: {logged_count}", x, y, self.green)
+            y += 15
+            
+            # Independent recording frame count
+            recorded_frames = getattr(self, 'recording_frame_count', 0)
+            self.draw_text(f"Recorded: {recorded_frames}", x, y, self.green)
         y += 20
         
         # RTSP URL display
@@ -1331,6 +1802,12 @@ class FastImGuiDetector:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
+                elif event.type == pygame.VIDEORESIZE:
+                    if not self.is_fullscreen:
+                        self.screen_width = event.w
+                        self.screen_height = event.h
+                        self.screen = pygame.display.set_mode((self.screen_width, self.screen_height), pygame.RESIZABLE)
+                        print(f"🪟 Window resized to: {self.screen_width}x{self.screen_height}")
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
                         if self.is_initializing:
