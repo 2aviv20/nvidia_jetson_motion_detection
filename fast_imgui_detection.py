@@ -85,8 +85,14 @@ class FastImGuiDetector:
         self.snapshot_feedback_timer = 0
         
         # Tab system
-        self.current_tab = "monitor"  # "monitor" or "gallery"
+        self.current_tab = "monitor"  # "monitor", "gallery", or "events"
         self.tab_height = 40
+        
+        # Event logging system
+        self.enable_event_logging = False
+        self.event_items = []
+        self.event_scroll = 0
+        self.selected_event = None
         
         # Gallery
         self.gallery_items = []
@@ -111,6 +117,9 @@ class FastImGuiDetector:
         # Create recordings directory structure
         self.setup_recording_directories()
         
+        # Create events directory structure
+        self.setup_events_directories()
+        
         # Load gallery items
         self.refresh_gallery()
         
@@ -128,6 +137,21 @@ class FastImGuiDetector:
         self.today_dir.mkdir(exist_ok=True)
         
         print(f"📁 Recording directory: {self.today_dir}")
+    
+    def setup_events_directories(self):
+        """Create directory structure for event logging"""
+        base_dir = Path("events")
+        base_dir.mkdir(exist_ok=True)
+        
+        # Create date-based subdirectory
+        today = datetime.now().strftime("%Y-%m-%d")
+        self.events_today_dir = base_dir / today
+        self.events_today_dir.mkdir(exist_ok=True)
+        
+        print(f"📁 Events directory: {self.events_today_dir}")
+        
+        # Load existing events
+        self.load_event_items()
     
     def get_timestamp_filename(self, file_type, extension):
         """Generate filename with format: [type]_[date]_[time]_[timestamp]"""
@@ -482,6 +506,119 @@ class FastImGuiDetector:
                 print("❌ Failed to save snapshot")
                 return False
         return False
+    
+    def take_event_snapshot(self, detection_info=None):
+        """Take a snapshot for event logging with detection info"""
+        if not self.enable_event_logging or self.current_frame is None:
+            return False
+        
+        try:
+            # Ensure directory exists for today
+            today = datetime.now().strftime("%Y-%m-%d")
+            today_dir = Path("events") / today
+            today_dir.mkdir(exist_ok=True)
+            
+            # Generate filename with timestamp
+            now = datetime.now()
+            timestamp = int(now.timestamp())
+            filename = f"event_{now.strftime('%H-%M-%S')}_{timestamp}.jpg"
+            filepath = today_dir / filename
+            
+            # Save current frame with detections if available
+            frame_to_save = self.current_frame.copy()
+            if detection_info and self.show_detections:
+                # Draw detection boxes on the saved image
+                frame_to_save = self.draw_detection_boxes(frame_to_save, detection_info)
+            
+            success = cv2.imwrite(str(filepath), frame_to_save)
+            if success:
+                # Create event record
+                event_record = {
+                    'timestamp': now.isoformat(),
+                    'filename': filename,
+                    'filepath': str(filepath),
+                    'detections': detection_info or [],
+                    'detection_count': len(detection_info) if detection_info else 0
+                }
+                
+                print(f"📸 Event snapshot saved: {filepath}")
+                
+                # Refresh events if we're in events tab
+                if self.current_tab == 'events':
+                    self.load_event_items()
+                
+                return event_record
+            else:
+                print("❌ Failed to save event snapshot")
+                return False
+                
+        except Exception as e:
+            print(f"❌ Error saving event snapshot: {e}")
+            return False
+    
+    def draw_detection_boxes(self, frame, detections):
+        """Draw detection boxes on frame for event snapshots"""
+        for detection in detections:
+            try:
+                # Handle different detection formats
+                if isinstance(detection, dict):
+                    if 'bbox' in detection:
+                        x1, y1, x2, y2 = map(int, detection['bbox'])
+                    else:
+                        x1, y1, x2, y2 = int(detection.get('x1', 0)), int(detection.get('y1', 0)), int(detection.get('x2', 0)), int(detection.get('y2', 0))
+                    
+                    obj_class = detection.get('class', detection.get('name', 'unknown'))
+                    confidence = float(detection.get('confidence', detection.get('conf', 0.0)))
+                else:
+                    # List/tuple format from PyTorchGPUDetector
+                    if len(detection) >= 6:
+                        x, y, w, h = detection[0], detection[1], detection[2], detection[3]
+                        x1, y1, x2, y2 = x, y, x + w, y + h
+                        confidence = detection[4]
+                        obj_class = detection[5]
+                    else:
+                        continue
+                
+                # Draw bounding box
+                color = (0, 255, 0)  # Green
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                
+                # Draw label
+                label = f"{obj_class}: {confidence:.2f}"
+                cv2.putText(frame, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                
+            except Exception as e:
+                print(f"⚠️ Error drawing detection box: {e}")
+                continue
+        
+        return frame
+    
+    def load_event_items(self):
+        """Load event items from events directory"""
+        self.event_items = []
+        events_dir = Path("events")
+        
+        if not events_dir.exists():
+            return
+        
+        # Scan all date directories for events
+        for date_dir in sorted(events_dir.glob("*"), reverse=True):  # Most recent first
+            if date_dir.is_dir():
+                # Get all event images in this directory
+                for event_file in sorted(date_dir.glob("event_*.jpg"), key=lambda x: x.stat().st_mtime, reverse=True):
+                    try:
+                        event_info = {
+                            'path': event_file,
+                            'filename': event_file.name,
+                            'date': date_dir.name,
+                            'timestamp': datetime.fromtimestamp(event_file.stat().st_mtime),
+                            'size': event_file.stat().st_size
+                        }
+                        self.event_items.append(event_info)
+                    except Exception as e:
+                        print(f"⚠️ Error processing event file {event_file}: {e}")
+        
+        print(f"📁 Loaded {len(self.event_items)} event items")
     
     def refresh_gallery(self):
         """Scan recordings directory and load folders and media files"""
@@ -891,6 +1028,12 @@ class FastImGuiDetector:
         if self.draw_button(tab_x + tab_width + 5, tab_y, tab_width, self.tab_height, "🖼️ Gallery", style=gallery_style):
             self.current_tab = 'gallery'
             self.refresh_gallery()  # Refresh when switching to gallery
+        
+        # Events tab
+        events_style = 'success' if self.current_tab == 'events' else 'normal'  
+        if self.draw_button(tab_x + 2 * tab_width + 10, tab_y, tab_width, self.tab_height, "🎯 Events", style=events_style):
+            self.current_tab = 'events'
+            self.load_event_items()  # Refresh when switching to events
     
     def render_gallery(self):
         """Render gallery view with folder browsing and thumbnail grid"""
@@ -1083,6 +1226,146 @@ class FastImGuiDetector:
         
         if self.gallery_scroll < max_scroll:
             self.draw_text("↓ More items below (Arrow keys)", gallery_x + 10, gallery_y + gallery_h - 25, self.yellow)
+    
+    def render_events(self):
+        """Render events view with event list and thumbnails"""
+        # Events area
+        events_x = 10
+        events_y = 60  # Below tabs
+        events_w = self.screen_width - 20
+        events_h = self.screen_height - events_y - 10
+        
+        # Background
+        pygame.draw.rect(self.screen, self.panel_bg, (events_x, events_y, events_w, events_h))
+        pygame.draw.rect(self.screen, self.text_color, (events_x, events_y, events_w, events_h), 1)
+        
+        # Navigation bar
+        nav_h = 40
+        pygame.draw.rect(self.screen, (50, 50, 50), (events_x, events_y, events_w, nav_h))
+        
+        nav_y = events_y + 10
+        
+        # Title and status
+        status_text = "ON" if self.enable_event_logging else "OFF"
+        status_color = self.green if self.enable_event_logging else self.red
+        self.draw_text(f"🎯 Event Log ({len(self.event_items)} events) - Status: ", events_x + 10, nav_y + 3, self.text_color)
+        self.draw_text(status_text, events_x + 260, nav_y + 3, status_color)
+        
+        # Content area
+        content_y = events_y + nav_h
+        content_h = events_h - nav_h
+        
+        if len(self.event_items) == 0:
+            # No events message
+            if self.enable_event_logging:
+                no_events_text = "No events captured yet. Start detection and events will appear when objects are detected!"
+            else:
+                no_events_text = "Event logging is disabled. Enable it in the Monitor tab to start capturing events."
+            self.draw_text(no_events_text, events_x + 10, content_y + 40, (150, 150, 150))
+            
+            # Instructions
+            instructions = [
+                "• Event logging automatically captures snapshots when objects are detected",
+                "• Each snapshot is saved with detection boxes and timestamp",
+                "• Images are organized by date in the 'events' folder",
+                "• Click on any event image to view it full size"
+            ]
+            for i, instruction in enumerate(instructions):
+                self.draw_text(instruction, events_x + 20, content_y + 80 + i * 25, (120, 120, 120))
+            return
+        
+        # Event list view
+        y = content_y + 10
+        item_height = 80
+        visible_items = 0
+        max_visible = int(content_h / item_height)
+        
+        for i, event in enumerate(self.event_items):
+            if i < self.event_scroll:
+                continue
+                
+            if visible_items >= max_visible:
+                break
+            
+            # Event item background
+            item_bg = (45, 45, 45) if i % 2 == 0 else (50, 50, 50)
+            item_rect = (events_x + 10, y, events_w - 20, item_height - 5)
+            
+            # Check if clicked/hovered
+            mouse_x, mouse_y = self.mouse_pos
+            hovered = (events_x + 10 <= mouse_x <= events_x + events_w - 10 and 
+                      y <= mouse_y <= y + item_height - 5)
+            
+            if hovered:
+                item_bg = (70, 70, 70)
+            
+            pygame.draw.rect(self.screen, item_bg, item_rect)
+            pygame.draw.rect(self.screen, (80, 80, 80), item_rect, 1)
+            
+            # Event thumbnail
+            thumbnail_size = 60
+            thumb_x = events_x + 20
+            thumb_y = y + 10
+            
+            # Generate and display thumbnail
+            try:
+                thumbnail = self.generate_thumbnail(event['path'], (thumbnail_size, thumbnail_size))
+                if thumbnail:
+                    self.screen.blit(thumbnail, (thumb_x, thumb_y))
+                else:
+                    # Fallback icon
+                    pygame.draw.rect(self.screen, (60, 60, 60), (thumb_x, thumb_y, thumbnail_size, thumbnail_size))
+                    icon_surface = self.font_large.render("📸", True, self.text_color)
+                    icon_rect = icon_surface.get_rect(center=(thumb_x + thumbnail_size//2, thumb_y + thumbnail_size//2))
+                    self.screen.blit(icon_surface, icon_rect)
+            except Exception as e:
+                # Fallback icon on error
+                pygame.draw.rect(self.screen, (60, 60, 60), (thumb_x, thumb_y, thumbnail_size, thumbnail_size))
+                icon_surface = self.font_large.render("⚠️", True, self.red)
+                icon_rect = icon_surface.get_rect(center=(thumb_x + thumbnail_size//2, thumb_y + thumbnail_size//2))
+                self.screen.blit(icon_surface, icon_rect)
+            
+            # Event information
+            info_x = thumb_x + thumbnail_size + 15
+            info_y = y + 10
+            
+            # Date and time
+            date_str = event['timestamp'].strftime("%Y-%m-%d %H:%M:%S")
+            self.draw_text(f"📅 {date_str}", info_x, info_y, self.text_color)
+            
+            # Filename
+            self.draw_text(f"📄 {event['filename']}", info_x, info_y + 20, (200, 200, 200))
+            
+            # File size
+            size_mb = event['size'] / (1024 * 1024)
+            self.draw_text(f"💾 {size_mb:.2f} MB", info_x, info_y + 40, (150, 150, 150))
+            
+            # Date folder
+            self.draw_text(f"📁 {event['date']}", info_x + 300, info_y, (120, 120, 120))
+            
+            # Click to view
+            if hovered and self.mouse_clicked:
+                # Set up for image viewer (reuse the media viewer from gallery)
+                self.selected_media = {
+                    'path': event['path'],
+                    'name': event['filename'],
+                    'type': 'image',
+                    'size': event['size'],
+                    'mtime': event['timestamp'].timestamp()
+                }
+                self.selected_event = event
+            
+            y += item_height
+            visible_items += 1
+        
+        # Scroll indicators
+        max_scroll = max(0, len(self.event_items) - max_visible)
+        
+        if self.event_scroll > 0:
+            self.draw_text("↑ Scroll up (Arrow keys)", events_x + 10, content_y - 15, self.yellow)
+        
+        if self.event_scroll < max_scroll:
+            self.draw_text("↓ More events below (Arrow keys)", events_x + 10, events_y + events_h - 25, self.yellow)
     
     def draw_button(self, x, y, w, h, text, active=True, style='normal'):
         """Optimized button drawing"""
@@ -1309,16 +1592,20 @@ class FastImGuiDetector:
                                 obj_class = detection.get('class', detection.get('name', 'unknown'))
                                 confidence = float(detection.get('confidence', detection.get('conf', 0.0)))
                             else:
-                                # List/tuple format [x1, y1, x2, y2, conf, class_id]
-                                if len(detection) >= 4:
-                                    x1, y1, x2, y2 = map(int, detection[:4])
-                                    confidence = float(detection[4]) if len(detection) > 4 else 0.0
-                                    obj_class = str(detection[5]) if len(detection) > 5 else 'unknown'
+                                # List/tuple format [x, y, w, h, conf, class_id] from PyTorchGPUDetector
+                                if len(detection) >= 6:
+                                    # Direct unpacking - avoid type conversions in loop
+                                    x, y, w, h = detection[0], detection[1], detection[2], detection[3]
+                                    # Fast coordinate conversion
+                                    x1, y1, x2, y2 = x, y, x + w, y + h
+                                    confidence = detection[4]
+                                    obj_class = detection[5]
                                 else:
                                     continue  # Skip invalid detections
                             
-                            center_x = (x1 + x2) // 2
-                            center_y = (y1 + y2) // 2
+                            # Optimized calculations using direct arithmetic
+                            center_x = x1 + (x2 - x1) // 2
+                            center_y = y1 + (y2 - y1) // 2
                             width = x2 - x1
                             height = y2 - y1
                             
@@ -1340,6 +1627,14 @@ class FastImGuiDetector:
                         except Exception as e:
                             print(f"⚠️ Error processing detection: {e}")
                             continue
+                
+                # Event logging - capture snapshot when objects are detected
+                if self.enable_event_logging and detections:
+                    try:
+                        # Take event snapshot with detection information
+                        self.take_event_snapshot(detections)
+                    except Exception as e:
+                        print(f"⚠️ Error in event logging: {e}")
                 
                 # Draw detections for display (not for recording)
                 if self.show_detections and detections:
@@ -1404,14 +1699,14 @@ class FastImGuiDetector:
             self.cap = None
     
     def update_video_surface(self):
-        """Fast video surface update"""
+        """Fast video surface update with minimal overhead"""
         if self.current_frame is None:
             return
             
         with self.frame_lock:
             frame = self.current_frame.copy()
         
-        # Direct conversion (fastest method)
+        # Fast conversion - use the original method for best performance
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         frame_rotated = np.rot90(frame_rgb)
         frame_flipped = np.flipud(frame_rotated)
@@ -1464,6 +1759,12 @@ class FastImGuiDetector:
         gui_color = 'success' if self.show_gui_info else 'normal'
         if self.draw_button(x + 90, y, 60, 25, "GUI", style=gui_color):
             self.show_gui_info = not self.show_gui_info
+        
+        # Event logging toggle (new row)
+        events_color = 'success' if self.enable_event_logging else 'normal'
+        if self.draw_button(x + 160, y, 70, 25, "Events", style=events_color):
+            self.enable_event_logging = not self.enable_event_logging
+            print(f"🎯 Event Logging: {'ON' if self.enable_event_logging else 'OFF'}")
         y += 35
         
         rtsp_color = 'success' if self.enable_rtsp else 'normal'
@@ -1829,11 +2130,13 @@ class FastImGuiDetector:
                         if not self.is_initializing:
                             self.toggle_fullscreen()
                     elif event.key == pygame.K_UP:
-                        # Scroll up in gallery
+                        # Scroll up in gallery or events
                         if self.current_tab == 'gallery' and self.gallery_scroll > 0:
                             self.gallery_scroll -= 1
+                        elif self.current_tab == 'events' and self.event_scroll > 0:
+                            self.event_scroll -= 1
                     elif event.key == pygame.K_DOWN:
-                        # Scroll down in gallery
+                        # Scroll down in gallery or events
                         if self.current_tab == 'gallery':
                             # Calculate proper max scroll based on current view
                             if self.current_folder is None:
@@ -1856,6 +2159,15 @@ class FastImGuiDetector:
                             
                             if self.gallery_scroll < max_scroll:
                                 self.gallery_scroll += 1
+                        elif self.current_tab == 'events':
+                            # Calculate max scroll for events
+                            content_h = self.screen_height - 60 - 40  # Screen minus tabs minus nav
+                            item_height = 80
+                            max_visible = int(content_h / item_height)
+                            max_scroll = max(0, len(self.event_items) - max_visible)
+                            
+                            if self.event_scroll < max_scroll:
+                                self.event_scroll += 1
             
             # Clear screen
             self.screen.fill(self.bg_dark)
@@ -1882,6 +2194,10 @@ class FastImGuiDetector:
                 elif self.current_tab == 'gallery':
                     # Gallery tab - show media files
                     self.render_gallery()
+                    
+                elif self.current_tab == 'events':
+                    # Events tab - show event list
+                    self.render_events()
             
             # Media viewer overlay (renders on top of everything)
             if self.selected_media:

@@ -124,7 +124,12 @@ class DetectionVideoPlayer:
             self.video_duration = self.total_frames / self.fps
             self.current_frame_num = 0
             
+            # Get video resolution
+            video_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            video_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            
             print(f"📊 Video properties: {self.total_frames} frames at {self.fps:.1f} fps")
+            print(f"📐 Video resolution: {video_width}x{video_height}")
             
             if self.total_frames <= 0:
                 print(f"⚠️ Warning: Video has no frames or frame count unknown")

@@ -1,6 +1,7 @@
 # Recordings folder - contains generated media files
 recordings/
 test_recordings/
+events/
 
 # Python cache
 __pycache__/
