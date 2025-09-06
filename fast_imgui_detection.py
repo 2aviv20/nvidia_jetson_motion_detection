@@ -8,6 +8,8 @@ import argparse
 import os
 import json
 import csv
+import queue
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from pytorch_gpu_detection import PyTorchGPUDetector, get_local_ip, get_stream_url
@@ -94,6 +96,23 @@ class FastImGuiDetector:
         self.event_scroll = 0
         self.selected_event = None
         
+        # Event video recording system - optimized for performance
+        self.event_pre_buffer = deque(maxlen=450)  # Efficient circular buffer (15s at 30fps)
+        self.event_recording = False
+        self.event_post_frames = 0
+        self.event_max_post_frames = 450  # 15 seconds post-detection
+        self.event_video_writer = None
+        self.event_video_path = None
+        self.event_start_time = None
+        self.event_detection_types = []
+        self.last_detection_time = None
+        
+        # Thread-safe event processing
+        self.event_queue = queue.Queue(maxsize=100)  # Limit queue size to prevent memory issues
+        self.event_thread = None
+        self.event_thread_running = False
+        self.event_processing_lock = threading.Lock()
+        
         # Gallery
         self.gallery_items = []
         self.gallery_folders = []
@@ -122,6 +141,9 @@ class FastImGuiDetector:
         
         # Load gallery items
         self.refresh_gallery()
+        
+        # Start event processing thread
+        self.start_event_thread()
         
         # Start automatic initialization
         self.start_initialization()
@@ -152,6 +174,54 @@ class FastImGuiDetector:
         
         # Load existing events
         self.load_event_items()
+    
+    def start_event_thread(self):
+        """Start the background event processing thread"""
+        if not self.event_thread_running:
+            self.event_thread_running = True
+            self.event_thread = threading.Thread(target=self.event_processing_worker, daemon=True)
+            self.event_thread.start()
+            print("🧵 Event processing thread started")
+    
+    def stop_event_thread(self):
+        """Stop the background event processing thread"""
+        if self.event_thread_running:
+            self.event_thread_running = False
+            # Add a poison pill to wake up the thread
+            try:
+                self.event_queue.put(("STOP", None, None), timeout=1)
+            except queue.Full:
+                pass
+            if self.event_thread:
+                self.event_thread.join(timeout=2)
+            print("🧵 Event processing thread stopped")
+    
+    def event_processing_worker(self):
+        """Background thread worker for event processing"""
+        print("🎬 Event processing worker started")
+        
+        while self.event_thread_running:
+            try:
+                # Wait for event with timeout to allow thread shutdown
+                event_type, frame, detections = self.event_queue.get(timeout=1)
+                
+                if event_type == "STOP":
+                    break
+                elif event_type == "START_RECORDING":
+                    self._bg_start_event_recording(frame, detections)
+                elif event_type == "WRITE_FRAME":
+                    self._bg_write_event_frame(frame)
+                elif event_type == "STOP_RECORDING":
+                    self._bg_stop_event_recording()
+                
+                self.event_queue.task_done()
+                
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"❌ Error in event processing worker: {e}")
+        
+        print("🎬 Event processing worker stopped")
     
     def get_timestamp_filename(self, file_type, extension):
         """Generate filename with format: [type]_[date]_[time]_[timestamp]"""
@@ -507,54 +577,358 @@ class FastImGuiDetector:
                 return False
         return False
     
-    def take_event_snapshot(self, detection_info=None):
-        """Take a snapshot for event logging with detection info"""
+    def start_event_recording(self, detection_info):
+        """Start recording event video with pre-buffer and detection info"""
         if not self.enable_event_logging or self.current_frame is None:
             return False
-        
-        try:
-            # Ensure directory exists for today
-            today = datetime.now().strftime("%Y-%m-%d")
-            today_dir = Path("events") / today
-            today_dir.mkdir(exist_ok=True)
             
-            # Generate filename with timestamp
-            now = datetime.now()
-            timestamp = int(now.timestamp())
-            filename = f"event_{now.strftime('%H-%M-%S')}_{timestamp}.jpg"
-            filepath = today_dir / filename
+        with self.event_recording_lock:
+            if self.event_recording:
+                # Update existing event with new detections
+                self.last_detection_time = time.time()
+                # Add new detection types
+                for detection in detection_info:
+                    det_type = self.get_detection_type(detection)
+                    if det_type not in self.event_detection_types:
+                        self.event_detection_types.append(det_type)
+                return True
             
-            # Save current frame with detections if available
-            frame_to_save = self.current_frame.copy()
-            if detection_info and self.show_detections:
-                # Draw detection boxes on the saved image
-                frame_to_save = self.draw_detection_boxes(frame_to_save, detection_info)
-            
-            success = cv2.imwrite(str(filepath), frame_to_save)
-            if success:
-                # Create event record
-                event_record = {
-                    'timestamp': now.isoformat(),
-                    'filename': filename,
-                    'filepath': str(filepath),
-                    'detections': detection_info or [],
-                    'detection_count': len(detection_info) if detection_info else 0
-                }
+            try:
+                # Ensure directory exists for today
+                today = datetime.now().strftime("%Y-%m-%d")
+                today_dir = Path("events") / today
+                today_dir.mkdir(exist_ok=True)
                 
-                print(f"📸 Event snapshot saved: {filepath}")
+                # Generate filenames with timestamp
+                now = datetime.now()
+                self.event_start_time = now
+                timestamp = int(now.timestamp())
+                base_filename = f"event_{now.strftime('%H-%M-%S')}_{timestamp}"
+                
+                # Image filepath
+                img_filename = f"{base_filename}.jpg"
+                img_filepath = today_dir / img_filename
+                
+                # Video filepath
+                video_filename = f"{base_filename}.avi"
+                self.event_video_path = today_dir / video_filename
+                
+                # Save snapshot with detections
+                frame_to_save = self.current_frame.copy()
+                if detection_info:
+                    frame_to_save = self.draw_detection_boxes(frame_to_save, detection_info)
+                
+                cv2.imwrite(str(img_filepath), frame_to_save)
+                
+                # Get detection types
+                self.event_detection_types = []
+                for detection in detection_info:
+                    det_type = self.get_detection_type(detection)
+                    if det_type not in self.event_detection_types:
+                        self.event_detection_types.append(det_type)
+                
+                # Start video recording
+                self.start_event_video_recording()
+                
+                # Mark as recording
+                self.event_recording = True
+                self.last_detection_time = time.time()
+                self.event_post_frames = 0
+                
+                print(f"🎬 Event recording started: {video_filename}")
+                print(f"📸 Event snapshot saved: {img_filename}")
+                print(f"🎯 Detected objects: {', '.join(self.event_detection_types)}")
+                
+                return True
+                
+            except Exception as e:
+                print(f"❌ Error starting event recording: {e}")
+                return False
+    
+    def start_event_video_recording(self):
+        """Initialize video writer for event recording"""
+        if not self.event_video_path or len(self.event_pre_buffer) == 0:
+            return False
+            
+        try:
+            # Get frame dimensions from pre-buffer
+            h, w = self.event_pre_buffer[0].shape[:2]
+            fps = 30.0
+            
+            # Try to create video writer
+            fourcc = cv2.VideoWriter_fourcc(*'XVID')
+            self.event_video_writer = cv2.VideoWriter(str(self.event_video_path), fourcc, fps, (w, h))
+            
+            if not self.event_video_writer.isOpened():
+                print("❌ Failed to open event video writer")
+                return False
+            
+            # Write pre-buffer frames
+            for frame in self.event_pre_buffer:
+                self.event_video_writer.write(frame)
+            
+            print(f"✅ Event video writer initialized, wrote {len(self.event_pre_buffer)} pre-buffer frames")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error initializing event video writer: {e}")
+            return False
+    
+    def get_detection_type(self, detection):
+        """Extract human-readable detection type"""
+        try:
+            if isinstance(detection, dict):
+                obj_class = detection.get('class', detection.get('name', 'unknown'))
+            else:
+                # List/tuple format from PyTorchGPUDetector
+                if len(detection) >= 6:
+                    obj_class = detection[5]
+                else:
+                    obj_class = 'unknown'
+            
+            # Map numeric classes to human-readable names (COCO dataset)
+            coco_classes = {
+                '0': 'person', '1': 'bicycle', '2': 'car', '3': 'motorcycle', '4': 'airplane',
+                '5': 'bus', '6': 'train', '7': 'truck', '8': 'boat', '9': 'traffic light',
+                '10': 'fire hydrant', '11': 'stop sign', '12': 'parking meter', '13': 'bench',
+                '14': 'bird', '15': 'cat', '16': 'dog', '17': 'horse', '18': 'sheep', '19': 'cow',
+                '20': 'elephant', '21': 'bear', '22': 'zebra', '23': 'giraffe', '24': 'backpack',
+                '25': 'umbrella', '26': 'handbag', '27': 'tie', '28': 'suitcase', '29': 'frisbee',
+                '30': 'skis', '31': 'snowboard', '32': 'sports ball', '33': 'kite', '34': 'baseball bat',
+                '35': 'baseball glove', '36': 'skateboard', '37': 'surfboard', '38': 'tennis racket',
+                '39': 'bottle', '40': 'wine glass', '41': 'cup', '42': 'fork', '43': 'knife',
+                '44': 'spoon', '45': 'bowl', '46': 'banana', '47': 'apple', '48': 'sandwich',
+                '49': 'orange', '50': 'broccoli', '51': 'carrot', '52': 'hot dog', '53': 'pizza',
+                '54': 'donut', '55': 'cake', '56': 'chair', '57': 'couch', '58': 'potted plant',
+                '59': 'bed', '60': 'dining table', '61': 'toilet', '62': 'tv', '63': 'laptop',
+                '64': 'mouse', '65': 'remote', '66': 'keyboard', '67': 'cell phone', '68': 'microwave',
+                '69': 'oven', '70': 'toaster', '71': 'sink', '72': 'refrigerator', '73': 'book',
+                '74': 'clock', '75': 'vase', '76': 'scissors', '77': 'teddy bear', '78': 'hair drier',
+                '79': 'toothbrush'
+            }
+            
+            return coco_classes.get(str(obj_class), str(obj_class))
+            
+        except Exception as e:
+            print(f"⚠️ Error getting detection type: {e}")
+            return 'unknown'
+    
+    def stop_event_recording(self):
+        """Stop event recording and save video"""
+        with self.event_recording_lock:
+            if not self.event_recording:
+                return
+                
+            try:
+                # Close video writer
+                if self.event_video_writer:
+                    self.event_video_writer.release()
+                    self.event_video_writer = None
+                
+                # Create event record with video and detection info
+                if self.event_start_time and self.event_video_path:
+                    # Create event metadata
+                    event_record = {
+                        'timestamp': self.event_start_time.isoformat(),
+                        'video_path': str(self.event_video_path),
+                        'detection_types': self.event_detection_types,
+                        'duration': time.time() - self.last_detection_time + 15,  # Approximate duration
+                        'has_video': True
+                    }
+                    
+                    # Save metadata JSON
+                    metadata_path = str(self.event_video_path).replace('.avi', '_metadata.json')
+                    with open(metadata_path, 'w') as f:
+                        json.dump(event_record, f, indent=2)
+                    
+                    print(f"🎬 Event recording stopped: {self.event_video_path.name}")
+                    print(f"📊 Event metadata saved: {metadata_path}")
+                    print(f"🎯 Final detection types: {', '.join(self.event_detection_types)}")
+                
+                # Reset recording state
+                self.event_recording = False
+                self.event_post_frames = 0
+                self.event_video_path = None
+                self.event_start_time = None
+                self.event_detection_types = []
+                self.last_detection_time = None
                 
                 # Refresh events if we're in events tab
                 if self.current_tab == 'events':
                     self.load_event_items()
-                
-                return event_record
-            else:
-                print("❌ Failed to save event snapshot")
-                return False
-                
-        except Exception as e:
-            print(f"❌ Error saving event snapshot: {e}")
+                    
+            except Exception as e:
+                print(f"❌ Error stopping event recording: {e}")
+    
+    def take_event_snapshot(self, detection_info=None):
+        """Legacy method - now redirects to queue_event_recording"""
+        return self.queue_event_recording(detection_info)
+    
+    def queue_event_recording(self, detection_info):
+        """Queue event recording request to background thread (non-blocking)"""
+        if not self.enable_event_logging or self.current_frame is None:
             return False
+        
+        # Quick check if already recording
+        with self.event_processing_lock:
+            if self.event_recording:
+                # Update existing event
+                self.last_detection_time = time.time()
+                for detection in detection_info:
+                    det_type = self.get_detection_type(detection)
+                    if det_type not in self.event_detection_types:
+                        self.event_detection_types.append(det_type)
+                # Queue frame for writing (non-blocking)
+                try:
+                    self.event_queue.put(("WRITE_FRAME", self.current_frame.copy(), None), block=False)
+                except queue.Full:
+                    pass  # Skip frame if queue is full to maintain performance
+                return True
+            
+            # Queue new recording start (non-blocking)
+            try:
+                self.event_queue.put(("START_RECORDING", self.current_frame.copy(), detection_info), block=False)
+                return True
+            except queue.Full:
+                print("⚠️ Event queue full, skipping event recording")
+                return False
+    
+    def _bg_start_event_recording(self, frame, detection_info):
+        """Background thread method to start event recording"""
+        with self.event_processing_lock:
+            if self.event_recording:
+                return
+            
+            try:
+                # Ensure directory exists for today
+                today = datetime.now().strftime("%Y-%m-%d")
+                today_dir = Path("events") / today
+                today_dir.mkdir(exist_ok=True)
+                
+                # Generate filenames with timestamp
+                now = datetime.now()
+                self.event_start_time = now
+                timestamp = int(now.timestamp())
+                base_filename = f"event_{now.strftime('%H-%M-%S')}_{timestamp}"
+                
+                # Image filepath
+                img_filename = f"{base_filename}.jpg"
+                img_filepath = today_dir / img_filename
+                
+                # Video filepath
+                video_filename = f"{base_filename}.avi"
+                self.event_video_path = today_dir / video_filename
+                
+                # Save snapshot with detections (in background thread)
+                frame_to_save = frame.copy()
+                if detection_info:
+                    frame_to_save = self.draw_detection_boxes(frame_to_save, detection_info)
+                
+                cv2.imwrite(str(img_filepath), frame_to_save)
+                
+                # Get detection types
+                self.event_detection_types = []
+                for detection in detection_info:
+                    det_type = self.get_detection_type(detection)
+                    if det_type not in self.event_detection_types:
+                        self.event_detection_types.append(det_type)
+                
+                # Start video recording
+                self._bg_start_event_video_recording()
+                
+                # Mark as recording
+                self.event_recording = True
+                self.last_detection_time = time.time()
+                self.event_post_frames = 0
+                
+                print(f"🎬 Event recording started: {video_filename}")
+                print(f"📸 Event snapshot saved: {img_filename}")
+                print(f"🎯 Detected objects: {', '.join(self.event_detection_types)}")
+                
+            except Exception as e:
+                print(f"❌ Error starting event recording: {e}")
+    
+    def _bg_start_event_video_recording(self):
+        """Background method to initialize video writer for event recording"""
+        if not self.event_video_path or len(self.event_pre_buffer) == 0:
+            return False
+            
+        try:
+            # Get frame dimensions from pre-buffer
+            h, w = self.event_pre_buffer[0].shape[:2]
+            fps = 30.0
+            
+            # Try to create video writer
+            fourcc = cv2.VideoWriter_fourcc(*'XVID')
+            self.event_video_writer = cv2.VideoWriter(str(self.event_video_path), fourcc, fps, (w, h))
+            
+            if not self.event_video_writer.isOpened():
+                print("❌ Failed to open event video writer")
+                return False
+            
+            # Write pre-buffer frames
+            for frame in self.event_pre_buffer:
+                self.event_video_writer.write(frame)
+            
+            print(f"✅ Event video writer initialized, wrote {len(self.event_pre_buffer)} pre-buffer frames")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error initializing event video writer: {e}")
+            return False
+    
+    def _bg_write_event_frame(self, frame):
+        """Background method to write frame to event video"""
+        if self.event_video_writer and self.event_recording:
+            try:
+                self.event_video_writer.write(frame)
+            except Exception as e:
+                print(f"❌ Error writing event frame: {e}")
+    
+    def _bg_stop_event_recording(self):
+        """Background method to stop event recording and save video"""
+        with self.event_processing_lock:
+            if not self.event_recording:
+                return
+                
+            try:
+                # Close video writer
+                if self.event_video_writer:
+                    self.event_video_writer.release()
+                    self.event_video_writer = None
+                
+                # Create event record with video and detection info
+                if self.event_start_time and self.event_video_path:
+                    # Create event metadata
+                    event_record = {
+                        'timestamp': self.event_start_time.isoformat(),
+                        'video_path': str(self.event_video_path),
+                        'detection_types': self.event_detection_types,
+                        'duration': time.time() - self.last_detection_time + 15,  # Approximate duration
+                        'has_video': True
+                    }
+                    
+                    # Save metadata JSON
+                    metadata_path = str(self.event_video_path).replace('.avi', '_metadata.json')
+                    with open(metadata_path, 'w') as f:
+                        json.dump(event_record, f, indent=2)
+                    
+                    print(f"🎬 Event recording stopped: {self.event_video_path.name}")
+                    print(f"📊 Event metadata saved: {metadata_path}")
+                    print(f"🎯 Final detection types: {', '.join(self.event_detection_types)}")
+                
+                # Reset recording state
+                self.event_recording = False
+                self.event_post_frames = 0
+                self.event_video_path = None
+                self.event_start_time = None
+                self.event_detection_types = []
+                self.last_detection_time = None
+                
+                # Refresh events if we're in events tab (main thread will handle)
+                
+            except Exception as e:
+                print(f"❌ Error stopping event recording: {e}")
     
     def draw_detection_boxes(self, frame, detections):
         """Draw detection boxes on frame for event snapshots"""
@@ -594,7 +968,7 @@ class FastImGuiDetector:
         return frame
     
     def load_event_items(self):
-        """Load event items from events directory"""
+        """Load event items from events directory with video and metadata support"""
         self.event_items = []
         events_dir = Path("events")
         
@@ -607,14 +981,40 @@ class FastImGuiDetector:
                 # Get all event images in this directory
                 for event_file in sorted(date_dir.glob("event_*.jpg"), key=lambda x: x.stat().st_mtime, reverse=True):
                     try:
+                        # Basic event info
                         event_info = {
                             'path': event_file,
                             'filename': event_file.name,
                             'date': date_dir.name,
                             'timestamp': datetime.fromtimestamp(event_file.stat().st_mtime),
-                            'size': event_file.stat().st_size
+                            'size': event_file.stat().st_size,
+                            'detection_types': [],
+                            'has_video': False,
+                            'video_path': None,
+                            'duration': 0
                         }
+                        
+                        # Check for associated video and metadata
+                        base_name = event_file.stem  # filename without extension
+                        video_file = date_dir / f"{base_name}.avi"
+                        metadata_file = date_dir / f"{base_name}_metadata.json"
+                        
+                        if video_file.exists():
+                            event_info['has_video'] = True
+                            event_info['video_path'] = video_file
+                            
+                            # Load metadata if available
+                            if metadata_file.exists():
+                                try:
+                                    with open(metadata_file, 'r') as f:
+                                        metadata = json.load(f)
+                                    event_info['detection_types'] = metadata.get('detection_types', [])
+                                    event_info['duration'] = metadata.get('duration', 0)
+                                except Exception as e:
+                                    print(f"⚠️ Error loading metadata {metadata_file}: {e}")
+                        
                         self.event_items.append(event_info)
+                        
                     except Exception as e:
                         print(f"⚠️ Error processing event file {event_file}: {e}")
         
@@ -1333,15 +1733,45 @@ class FastImGuiDetector:
             date_str = event['timestamp'].strftime("%Y-%m-%d %H:%M:%S")
             self.draw_text(f"📅 {date_str}", info_x, info_y, self.text_color)
             
-            # Filename
-            self.draw_text(f"📄 {event['filename']}", info_x, info_y + 20, (200, 200, 200))
+            # Detection types
+            if event.get('detection_types'):
+                det_types_text = f"🎯 {', '.join(event['detection_types'])}"
+                self.draw_text(det_types_text, info_x, info_y + 20, self.yellow)
+            else:
+                self.draw_text("🎯 Unknown objects", info_x, info_y + 20, (150, 150, 150))
             
-            # File size
+            # File size and video status
             size_mb = event['size'] / (1024 * 1024)
-            self.draw_text(f"💾 {size_mb:.2f} MB", info_x, info_y + 40, (150, 150, 150))
+            video_status = "📹 Video" if event.get('has_video') else "📸 Image"
+            self.draw_text(f"💾 {size_mb:.2f} MB | {video_status}", info_x, info_y + 40, (150, 150, 150))
+            
+            # Duration if available
+            if event.get('duration', 0) > 0:
+                duration_text = f"⏱️ {event['duration']:.1f}s"
+                self.draw_text(duration_text, info_x + 200, info_y + 40, (120, 120, 120))
             
             # Date folder
             self.draw_text(f"📁 {event['date']}", info_x + 300, info_y, (120, 120, 120))
+            
+            # Play button for videos
+            if event.get('has_video'):
+                play_x = events_x + events_w - 120
+                play_y = y + 20
+                if self.draw_button(play_x, play_y, 80, 30, "▶️ Play", style='success'):
+                    # Launch video player
+                    try:
+                        if event.get('video_path'):
+                            import subprocess
+                            player_script = Path(__file__).parent / "video_player.py"
+                            video_path = str(event['video_path'])
+                            
+                            if Path(video_path).exists():
+                                subprocess.Popen(['python3', str(player_script), video_path], start_new_session=True)
+                                print(f"🎬 Opening event video: {event['filename']}")
+                            else:
+                                print(f"❌ Event video not found: {video_path}")
+                    except Exception as e:
+                        print(f"❌ Error opening event video: {e}")
             
             # Click to view
             if hovered and self.mouse_clicked:
@@ -1569,6 +1999,10 @@ class FastImGuiDetector:
                     with self.recording_frame_lock:
                         self.shared_recording_frame = frame.copy()
                 
+                # Maintain circular buffer for event pre-recording (minimal overhead with deque)
+                if self.enable_event_logging:
+                    self.event_pre_buffer.append(frame)  # deque automatically handles max length
+                
                 # Detection
                 detections, inf_time = self.detector.detect_objects(frame)
                 fps = 1.0 / inf_time if inf_time > 0 else 0
@@ -1628,13 +2062,22 @@ class FastImGuiDetector:
                             print(f"⚠️ Error processing detection: {e}")
                             continue
                 
-                # Event logging - capture snapshot when objects are detected
+                # Event logging - optimized non-blocking approach
                 if self.enable_event_logging and detections:
                     try:
-                        # Take event snapshot with detection information
-                        self.take_event_snapshot(detections)
+                        # Queue event recording (non-blocking, maintains FPS)
+                        self.queue_event_recording(detections)
                     except Exception as e:
-                        print(f"⚠️ Error in event logging: {e}")
+                        print(f"⚠️ Error queuing event: {e}")
+                
+                # Check if we should stop event recording (lightweight check)
+                if self.event_recording and self.last_detection_time:
+                    if time.time() - self.last_detection_time >= 15:
+                        # Queue stop recording (non-blocking)
+                        try:
+                            self.event_queue.put(("STOP_RECORDING", None, None), block=False)
+                        except queue.Full:
+                            pass  # Will try again next frame
                 
                 # Draw detections for display (not for recording)
                 if self.show_detections and detections:
@@ -1691,9 +2134,18 @@ class FastImGuiDetector:
     def stop_detection(self):
         """Stop detection"""
         self.is_running = False
+        
+        # Stop event recording if active
+        if self.event_recording:
+            try:
+                self.event_queue.put(("STOP_RECORDING", None, None), block=False)
+            except queue.Full:
+                pass
+        
         # Stop recording if active
         if self.is_recording:
             self.stop_recording()
+            
         if self.cap:
             self.cap.release()
             self.cap = None
@@ -2212,6 +2664,7 @@ class FastImGuiDetector:
         
         # Cleanup
         self.stop_detection()
+        self.stop_event_thread()
         pygame.quit()
 
 def main():
