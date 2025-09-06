@@ -1356,16 +1356,15 @@ class FastImGuiDetector:
         button_y = info_y + 30
         if self.selected_media['type'] == 'video':
             if self.draw_button(viewer_x + 10, button_y, 120, 25, "🎬 Play in Player", style='normal'):
-                # Try to open with custom detection video player
+                # Open with Ubuntu's default video player
                 try:
                     if self.selected_media and self.selected_media.get('path'):
                         import subprocess
-                        player_script = Path(__file__).parent / "video_player.py"
                         video_path = str(self.selected_media['path'])
                         
                         if Path(video_path).exists():
-                            subprocess.Popen(['python3', str(player_script), video_path], start_new_session=True)
-                            print(f"🎬 Opening video in detection player: {self.selected_media.get('name', 'unknown')}")
+                            subprocess.Popen(['xdg-open', video_path], start_new_session=True)
+                            print(f"🎬 Opening video in Ubuntu video player: {self.selected_media.get('name', 'unknown')}")
                         else:
                             print(f"❌ Video file not found: {video_path}")
                     else:
@@ -1373,12 +1372,6 @@ class FastImGuiDetector:
                         
                 except Exception as e:
                     print(f"❌ Error opening video player: {e}")
-                    # Fallback to system player
-                    try:
-                        if self.selected_media and self.selected_media.get('path'):
-                            subprocess.Popen(['xdg-open', str(self.selected_media['path'])], start_new_session=True)
-                    except Exception as e2:
-                        print(f"❌ Error opening with system player: {e2}")
             
             # Check if this is a recording with detection data
             file_path = self.selected_media['path']
@@ -1762,12 +1755,11 @@ class FastImGuiDetector:
                     try:
                         if event.get('video_path'):
                             import subprocess
-                            player_script = Path(__file__).parent / "video_player.py"
                             video_path = str(event['video_path'])
                             
                             if Path(video_path).exists():
-                                subprocess.Popen(['python3', str(player_script), video_path], start_new_session=True)
-                                print(f"🎬 Opening event video: {event['filename']}")
+                                subprocess.Popen(['xdg-open', video_path], start_new_session=True)
+                                print(f"🎬 Opening event video in Ubuntu video player: {event['filename']}")
                             else:
                                 print(f"❌ Event video not found: {video_path}")
                     except Exception as e:
